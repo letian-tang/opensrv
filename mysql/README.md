@@ -65,7 +65,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     loop {
         let (stream, _) = listener.accept().await?;
         let (r, w) = stream.into_split();
-        tokio::spawn(async move { AsyncMysqlIntermediary::run_on(Backend, r, w).await });
+        tokio::spawn(async move { AsyncMysqlIntermediary::run_on_buffered(Backend, r, w).await });
     }
 }
 ```
@@ -77,6 +77,43 @@ cargo run --example=serve_one
 ```
 
 More examples can be found [here](examples).
+
+For production use, prefer `AsyncMysqlIntermediary::run_on_buffered(...)` or
+`run_with_options_buffered(...)` instead of wiring a bare stream directly. The buffered entrypoints
+add connection-level read/write buffering around the protocol layer and are more stable with
+real clients such as JDBC drivers.
+
+## Authentication and Compatibility
+
+This crate supports plugin-auth handshakes and can be used with both MySQL 5.7-style
+`mysql_native_password` and MySQL 8.0-style `caching_sha2_password` clients.
+
+The default shim behavior remains `mysql_native_password`, but a backend can opt into
+`caching_sha2_password` per connection or per user by returning
+`CACHING_SHA2_PASSWORD` from `default_auth_plugin()` or `auth_plugin_for_username()`.
+
+Helpers are provided to validate client auth responses against a known password:
+
+```rust
+use opensrv_mysql::verify_auth_plugin_data;
+
+async fn authenticate(
+    &self,
+    auth_plugin: &str,
+    _username: &[u8],
+    salt: &[u8],
+    auth_data: &[u8],
+) -> bool {
+    verify_auth_plugin_data(auth_plugin, b"secret", salt, auth_data)
+}
+```
+
+Compatibility notes:
+
+- MySQL 5.7 clients typically work with `mysql_native_password`.
+- MySQL 8.0 clients can work with either `mysql_native_password` or
+  `caching_sha2_password`, depending on what the server advertises.
+- If you want clients to identify the server as MySQL 8.0, override `version()` in your shim.
 
 ## Getting help
 

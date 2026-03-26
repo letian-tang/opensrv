@@ -54,41 +54,46 @@ impl<W> PacketWriter<W> {
 
 const PACKET_HEADER_SIZE: usize = 4;
 impl<W: AsyncWrite + Unpin> PacketWriter<W> {
+    async fn write_chunk(&mut self, chunk: &[u8]) -> io::Result<()> {
+        let mut header = [0; PACKET_HEADER_SIZE];
+        LittleEndian::write_u24(&mut header, chunk.len() as u32);
+        header[3] = self.packet_builder.seq();
+        self.packet_builder.increase_seq();
+
+        let written = self
+            .output_stream
+            .write_vectored(&[IoSlice::new(&header), IoSlice::new(chunk)])
+            .await?;
+
+        if written != PACKET_HEADER_SIZE + chunk.len() {
+            let remaining: Vec<u8> = header
+                .iter()
+                .chain(chunk.iter())
+                .skip(written)
+                .cloned()
+                .collect();
+            self.output_stream.write_all(&remaining).await?;
+        }
+
+        Ok(())
+    }
+
     /// Build packet(s) and write them to the output stream
     pub async fn end_packet(&mut self) -> io::Result<()> {
-        let builder = &mut self.packet_builder;
-        if !builder.is_empty() {
-            let raw_packet = builder.take_buffer();
+        if !self.packet_builder.is_empty() {
+            let raw_packet = self.packet_builder.take_buffer();
+            let needs_empty_packet = raw_packet.len() % U24_MAX == 0;
 
-            // split the rww buffer at the boundary of size U24_MAX
-            let chunks = raw_packet.chunks(U24_MAX);
-            let mut header = [0; PACKET_HEADER_SIZE];
-            for chunk in chunks {
-                // prepare the header
-                LittleEndian::write_u24(&mut header, chunk.len() as u32);
-                header[3] = builder.seq();
-                builder.increase_seq();
-
-                // write out the header and payload.
-                //
-                // depends on the AsyncWrite provided, this may trigger
-                // real system call or not (for example, if AsyncWrite is buffered stream)
-                let written = self
-                    .output_stream
-                    .write_vectored(&[IoSlice::new(&header), IoSlice::new(chunk)])
-                    .await?;
-
-                // if write buffer is not drained, fall back to write_all
-                if written != PACKET_HEADER_SIZE + chunk.len() {
-                    let remaining: Vec<u8> = header
-                        .iter()
-                        .chain(chunk.iter())
-                        .skip(written)
-                        .cloned()
-                        .collect();
-                    self.output_stream.write_all(&remaining).await?
-                }
+            // split the raw buffer at the boundary of size U24_MAX
+            for chunk in raw_packet.chunks(U24_MAX) {
+                self.write_chunk(chunk).await?;
             }
+
+            // Exact multiples of U24_MAX must be terminated by an empty packet.
+            if needs_empty_packet {
+                self.write_chunk(&[]).await?;
+            }
+
             Ok(())
         } else {
             Ok(())

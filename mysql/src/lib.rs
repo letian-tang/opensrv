@@ -30,12 +30,12 @@ use std::io::Write;
 use std::iter;
 
 use async_trait::async_trait;
-use tokio::io::AsyncRead;
-use tokio::io::AsyncWrite;
+use tokio::io::{AsyncRead, AsyncWrite, BufReader, BufWriter};
 #[cfg(feature = "tls")]
 use tokio_rustls::rustls::ServerConfig;
 
 pub use crate::myc::constants::{CapabilityFlags, ColumnFlags, ColumnType, StatusFlags};
+pub use crate::myc::scramble::{scramble_native, scramble_sha256};
 #[cfg(feature = "tls")]
 pub use crate::tls::{plain_run_with_options, secure_run_with_options};
 
@@ -105,7 +105,35 @@ pub use crate::value::{decode::to_naive_datetime, ToMysqlValue, Value, ValueInne
 use crate::{commands::ClientHandshake, packet_reader::PacketReader, packet_writer::PacketWriter};
 
 const SCRAMBLE_SIZE: usize = 20;
-const MYSQL_NATIVE_PASSWORD: &str = "mysql_native_password";
+pub const MYSQL_NATIVE_PASSWORD: &str = "mysql_native_password";
+pub const CACHING_SHA2_PASSWORD: &str = "caching_sha2_password";
+
+pub fn verify_mysql_native_password(password: &[u8], salt: &[u8], auth_data: &[u8]) -> bool {
+    match scramble_native(salt, password) {
+        Some(expected) => auth_data == expected,
+        None => auth_data.is_empty(),
+    }
+}
+
+pub fn verify_caching_sha2_password(password: &[u8], salt: &[u8], auth_data: &[u8]) -> bool {
+    match scramble_sha256(salt, password) {
+        Some(expected) => auth_data == expected,
+        None => auth_data.is_empty(),
+    }
+}
+
+pub fn verify_auth_plugin_data(
+    auth_plugin: &str,
+    password: &[u8],
+    salt: &[u8],
+    auth_data: &[u8],
+) -> bool {
+    match auth_plugin {
+        MYSQL_NATIVE_PASSWORD => verify_mysql_native_password(password, salt, auth_data),
+        CACHING_SHA2_PASSWORD => verify_caching_sha2_password(password, salt, auth_data),
+        _ => false,
+    }
+}
 
 #[async_trait]
 /// Implementors of this async-trait can be used to drive a MySQL-compatible database backend.
@@ -216,6 +244,10 @@ pub struct IntermediaryOptions {
     pub process_use_statement_on_query: bool,
     /// reject connection if dbname not provided
     pub reject_connection_on_dbname_absence: bool,
+    /// Optional read buffer size for buffered convenience entrypoints.
+    pub read_buffer_size: Option<usize>,
+    /// Optional write buffer size for buffered convenience entrypoints.
+    pub write_buffer_size: Option<usize>,
 }
 
 #[derive(Default)]
@@ -512,7 +544,6 @@ where
 
                 // auth switch
                 if !auth_plugin_expect.is_empty()
-                    && auth_response.is_empty()
                     && handshake.auth_plugin != auth_plugin_expect.as_bytes()
                 {
                     self.writer.set_seq(seq + 1);
@@ -704,7 +735,7 @@ where
                                 )
                             })?;
                             {
-                                let params = params::ParamParser::new(params, state);
+                                let params = params::ParamParser::new(params, state)?;
                                 let w = QueryResultWriter::new(
                                     &mut self.writer,
                                     true,
@@ -795,5 +826,44 @@ where
             }
         }
         Ok(())
+    }
+}
+
+impl<B, R, W> AsyncMysqlIntermediary<B, BufReader<R>, BufWriter<W>>
+where
+    W: AsyncWrite + Send + Unpin,
+    B: AsyncMysqlShim<BufWriter<W>> + Send + Sync,
+    R: AsyncRead + Send + Unpin,
+{
+    /// Create a new server over buffered channels and process client commands until the client
+    /// disconnects or an error occurs.
+    pub async fn run_on_buffered(
+        shim: B,
+        input_stream: R,
+        output_stream: W,
+    ) -> Result<(), <B as AsyncMysqlShim<BufWriter<W>>>::Error> {
+        Self::run_with_options_buffered(shim, input_stream, output_stream, &Default::default())
+            .await
+    }
+
+    /// Create a new server over buffered channels and process client commands until the client
+    /// disconnects or an error occurs, with config options.
+    pub async fn run_with_options_buffered(
+        shim: B,
+        input_stream: R,
+        output_stream: W,
+        opts: &IntermediaryOptions,
+    ) -> Result<(), <B as AsyncMysqlShim<BufWriter<W>>>::Error> {
+        let read_cap = opts.read_buffer_size.unwrap_or(8 * 1024);
+        let write_cap = opts.write_buffer_size.unwrap_or(8 * 1024);
+        let input_stream = BufReader::with_capacity(read_cap, input_stream);
+        let output_stream = BufWriter::with_capacity(write_cap, output_stream);
+        AsyncMysqlIntermediary::<B, BufReader<R>, BufWriter<W>>::run_with_options(
+            shim,
+            input_stream,
+            output_stream,
+            opts,
+        )
+        .await
     }
 }

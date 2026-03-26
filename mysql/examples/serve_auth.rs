@@ -16,6 +16,7 @@
 //!
 //! ```console
 //! $ echo "SELECT * FROM foo" | mysql -h 127.0.0.1 -u default --table
+//! $ echo "SELECT * FROM foo" | MYSQL_PWD=secret mysql -h 127.0.0.1 -u mysql8 --table
 //! $
 //! ```
 
@@ -28,6 +29,10 @@ use tokio::io::AsyncWrite;
 use tokio::net::TcpListener;
 
 struct Backend;
+
+const USER_NATIVE: &[u8] = b"default";
+const USER_CACHING_SHA2: &[u8] = b"mysql8";
+const PASSWORD: &[u8] = b"secret";
 
 #[async_trait::async_trait]
 impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for Backend {
@@ -78,17 +83,17 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for Backend {
     /// authenticate method for the specified plugin
     async fn authenticate(
         &self,
-        _auth_plugin: &str,
+        auth_plugin: &str,
         username: &[u8],
-        _salt: &[u8],
-        _auth_data: &[u8],
+        salt: &[u8],
+        auth_data: &[u8],
     ) -> bool {
-        username == "default".as_bytes()
+        matches!(username, USER_NATIVE | USER_CACHING_SHA2)
+            && verify_auth_plugin_data(auth_plugin, PASSWORD, salt, auth_data)
     }
 
     fn version(&self) -> String {
-        // 5.1.10 because that's what Ruby's ActiveRecord requires
-        "5.1.10-alpha-msql-proxy".to_string()
+        "8.0.36-opensrv".to_string()
     }
 
     fn connect_id(&self) -> u32 {
@@ -96,11 +101,15 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for Backend {
     }
 
     fn default_auth_plugin(&self) -> &str {
-        "mysql_native_password"
+        MYSQL_NATIVE_PASSWORD
     }
 
-    async fn auth_plugin_for_username(&self, _user: &[u8]) -> &'static str {
-        "mysql_native_password"
+    async fn auth_plugin_for_username(&self, user: &[u8]) -> &'static str {
+        if user == USER_CACHING_SHA2 {
+            CACHING_SHA2_PASSWORD
+        } else {
+            MYSQL_NATIVE_PASSWORD
+        }
     }
 
     fn salt(&self) -> [u8; 20] {
@@ -123,7 +132,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     loop {
         let (stream, _) = listener.accept().await?;
         let (r, w) = stream.into_split();
-        tokio::spawn(async move { AsyncMysqlIntermediary::run_on(Backend, r, w).await });
+        tokio::spawn(async move { AsyncMysqlIntermediary::run_on_buffered(Backend, r, w).await });
     }
 }
 

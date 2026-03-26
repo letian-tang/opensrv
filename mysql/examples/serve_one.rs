@@ -66,6 +66,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     loop {
         let (stream, _) = listener.accept().await?;
         let (r, w) = stream.into_split();
-        tokio::spawn(async move { AsyncMysqlIntermediary::run_on(Backend, r, w).await });
+        tokio::spawn(async move { AsyncMysqlIntermediary::run_on_buffered(Backend, r, w).await });
     }
 }

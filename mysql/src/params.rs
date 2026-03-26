@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use std::collections::HashMap;
+use std::io;
 
 use crate::myc;
 use crate::{StatementData, Value};
@@ -30,13 +31,94 @@ pub struct ParamParser<'a> {
 }
 
 impl<'a> ParamParser<'a> {
-    pub(crate) fn new(input: &'a [u8], stmt: &'a mut StatementData) -> Self {
-        ParamParser {
+    pub(crate) fn new(input: &'a [u8], stmt: &'a mut StatementData) -> io::Result<Self> {
+        let mut parser = ParamParser {
             params: stmt.params,
             bytes: input,
             long_data: &stmt.long_data,
             bound_types: &mut stmt.bound_types,
+        };
+        parser.validate()?;
+        Ok(parser)
+    }
+
+    fn validate(&mut self) -> io::Result<()> {
+        let mut input = self.bytes;
+        let nullmap_len = (self.params as usize).div_ceil(8);
+        if input.len() < nullmap_len {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "malformed execute packet: null-bitmap truncated",
+            ));
         }
+        let (nullmap, rest) = input.split_at(nullmap_len);
+        input = rest;
+
+        if self.params > 0 {
+            if input.is_empty() {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "malformed execute packet: missing new-params-bound flag",
+                ));
+            }
+
+            let new_params_bound = input[0] != 0x00;
+            input = &input[1..];
+
+            if new_params_bound {
+                let type_map_len = 2 * self.params as usize;
+                if input.len() < type_map_len {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "malformed execute packet: parameter type map truncated",
+                    ));
+                }
+
+                let (typmap, rest) = input.split_at(type_map_len);
+                self.bound_types.clear();
+                for i in 0..self.params as usize {
+                    let coltype = myc::constants::ColumnType::try_from(typmap[2 * i]).map_err(
+                        |e| {
+                            io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                format!("bad column type 0x{:x}: {}", typmap[2 * i], e),
+                            )
+                        },
+                    )?;
+                    self.bound_types
+                        .push((coltype, (typmap[2 * i + 1] & 128) != 0));
+                }
+                input = rest;
+            } else if self.bound_types.len() < self.params as usize {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "execute packet omitted parameter types before they were bound",
+                ));
+            }
+        }
+
+        for col in 0..self.params {
+            let byte = col as usize / 8;
+            if byte >= nullmap.len() {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "malformed execute packet: null-bitmap too short",
+                ));
+            }
+            if (nullmap[byte] & (1u8 << (col % 8))) != 0 || self.long_data.contains_key(&col) {
+                continue;
+            }
+
+            let (coltype, unsigned) = self.bound_types.get(col as usize).copied().ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("missing bound type for parameter {}", col),
+                )
+            })?;
+            Value::parse_from(&mut input, coltype, unsigned)?;
+        }
+
+        Ok(())
     }
 }
 
@@ -80,20 +162,25 @@ impl<'a> Iterator for Params<'a> {
             let nullmap_len = (self.params as usize).div_ceil(8);
             let (nullmap, rest) = self.input.split_at(nullmap_len);
             self.nullmap = Some(nullmap);
-            self.input = rest;
 
-            if !rest.is_empty() && rest[0] != 0x00 {
-                let (typmap, rest) = rest[1..].split_at(2 * self.params as usize);
-                self.bound_types.clear();
-                for i in 0..self.params as usize {
-                    self.bound_types.push((
-                        myc::constants::ColumnType::try_from(typmap[2 * i]).unwrap_or_else(|e| {
-                            panic!("bad column type 0x{:x}: {}", typmap[2 * i], e)
-                        }),
-                        (typmap[2 * i + 1] & 128) != 0,
-                    ));
-                }
+            if self.params == 0 {
                 self.input = rest;
+            } else {
+                let new_params_bound = rest[0] != 0x00;
+                let rest = &rest[1..];
+                if new_params_bound {
+                    let (typmap, rest) = rest.split_at(2 * self.params as usize);
+                    self.bound_types.clear();
+                    for i in 0..self.params as usize {
+                        self.bound_types.push((
+                            myc::constants::ColumnType::try_from(typmap[2 * i]).unwrap(),
+                            (typmap[2 * i + 1] & 128) != 0,
+                        ));
+                    }
+                    self.input = rest;
+                } else {
+                    self.input = rest;
+                }
             }
         }
 
@@ -131,5 +218,39 @@ impl<'a> Iterator for Params<'a> {
             value: v,
             coltype: pt.0,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::myc::constants::ColumnType;
+
+    use super::*;
+
+    #[test]
+    fn parses_execute_params_without_rebinding_types() {
+        let mut stmt = StatementData {
+            params: 1,
+            bound_types: vec![(ColumnType::MYSQL_TYPE_LONG, false)],
+            ..Default::default()
+        };
+        let parser = ParamParser::new(&[0x00, 0x00, 42, 0, 0, 0], &mut stmt).unwrap();
+        let values: Vec<_> = parser.into_iter().collect();
+
+        assert_eq!(values.len(), 1);
+        assert_eq!(values[0].coltype, ColumnType::MYSQL_TYPE_LONG);
+        assert_eq!(i32::from(values[0].value), 42);
+    }
+
+    #[test]
+    fn rejects_truncated_execute_params() {
+        let mut stmt = StatementData {
+            params: 1,
+            bound_types: vec![(ColumnType::MYSQL_TYPE_LONG, false)],
+            ..Default::default()
+        };
+
+        let err = ParamParser::new(&[0x00], &mut stmt).err().unwrap();
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
     }
 }

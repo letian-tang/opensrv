@@ -22,11 +22,13 @@
 //
 // Wireshark also does a pretty good job at parsing the MySQL protocol.
 
+use std::io::Write;
+
 use tokio::io::{duplex, AsyncReadExt};
 
 use crate::packet_writer::PacketWriter;
 use crate::writers::write_ok_packet;
-use crate::{CapabilityFlags, OkResponse};
+use crate::{CapabilityFlags, OkResponse, U24_MAX};
 
 async fn capture_ok_payload(info: &str, capabilities: CapabilityFlags, header: u8) -> Vec<u8> {
     let (mut client, server) = duplex(1024);
@@ -200,4 +202,32 @@ async fn ok_packet_info_extended_lenenc_with_flags() {
 
     let encoded = &payload[idx..idx + info.len()];
     assert_eq!(encoded, info.as_bytes());
+}
+
+#[tokio::test]
+async fn packet_writer_terminates_exact_multiple_with_empty_packet() {
+    let (mut client, server) = duplex(U24_MAX + 16);
+    let mut writer = PacketWriter::new(server);
+
+    writer.write_all(&vec![0u8; U24_MAX]).expect("write payload");
+    writer.end_packet().await.expect("finish packet");
+
+    let mut header_buf = [0u8; 4];
+    client
+        .read_exact(&mut header_buf)
+        .await
+        .expect("first packet header");
+    assert_eq!(header_buf, [0xff, 0xff, 0xff, 0]);
+
+    let mut payload = vec![0u8; U24_MAX];
+    client
+        .read_exact(&mut payload)
+        .await
+        .expect("first packet payload");
+
+    client
+        .read_exact(&mut header_buf)
+        .await
+        .expect("terminator packet header");
+    assert_eq!(header_buf, [0x00, 0x00, 0x00, 1]);
 }

@@ -136,8 +136,9 @@ impl<R: AsyncRead + Unpin> AsyncRead for PacketReader<R> {
     ) -> std::task::Poll<io::Result<()>> {
         // if our buffer have content, send those immediately
         if !self.bytes.is_empty() {
-            buf.put_slice(&self.bytes);
-            self.bytes.clear();
+            let to_copy = buf.remaining().min(self.bytes.len());
+            let chunk = self.bytes.split_to(to_copy);
+            buf.put_slice(&chunk);
             std::task::Poll::Ready(Ok(()))
         } else {
             std::pin::Pin::new(&mut self.r).poll_read(cx, buf)
@@ -332,28 +333,73 @@ impl Deref for Packet<'_> {
 
 // note that for small packet, this function is zero-copy, but for packet >= 2^24 it currently copy stuff, this await further optimization
 pub(crate) fn packet<'a>(i: NomBytes) -> nom::IResult<NomBytes, (u8, Packet<'a>)> {
+    fn sequence_mismatch(input: &NomBytes) -> nom::Err<nom::error::Error<NomBytes>> {
+        nom::Err::Failure(nom::error::Error::new(
+            input.clone(),
+            nom::error::ErrorKind::Verify,
+        ))
+    }
+
     nom::combinator::map(
         nom::sequence::pair(
             nom::multi::fold_many0(
                 fullpacket,
-                || (0, None),
-                |(seq, pkt): (_, Option<BytesMut>), (nseq, p)| {
+                || {
+                    (
+                        0u8,
+                        None::<BytesMut>,
+                        None::<nom::Err<nom::error::Error<NomBytes>>>,
+                    )
+                },
+                |(
+                    seq,
+                    pkt,
+                    err,
+                ): (
+                    u8,
+                    Option<BytesMut>,
+                    Option<nom::Err<nom::error::Error<NomBytes>>>,
+                ),
+                 (nseq, p)| {
+                    if err.is_some() {
+                        return (seq, pkt, err);
+                    }
+
                     let pkt = if let Some(mut pkt) = pkt {
-                        assert_eq!(nseq, seq + 1);
+                        if nseq != seq.wrapping_add(1) {
+                            return (seq, Some(pkt), Some(sequence_mismatch(&p)));
+                        }
                         pkt.extend_from_slice(p.as_ref());
                         Some(pkt)
                     } else {
                         // TODO: avoid copy
                         Some(BytesMut::from(p.0))
                     };
-                    (nseq, pkt)
+                    (nseq, pkt, None)
                 },
             ),
             nom::combinator::opt(onepacket),
         ),
-        move |((full_seq, full_pkt), last)| match (full_pkt, last) {
+        move |(
+            (full_seq, full_pkt, err),
+            last,
+        ): (
+            (
+                u8,
+                Option<BytesMut>,
+                Option<nom::Err<nom::error::Error<NomBytes>>>,
+            ),
+            Option<(u8, NomBytes)>,
+        )| {
+            if let Some(err) = err {
+                return Err(err);
+            }
+
+            match (full_pkt, last) {
             (Some(mut full_pkt), Some((last_seq, last_pkt))) => {
-                assert_eq!(last_seq, full_seq + 1);
+                if last_seq != full_seq.wrapping_add(1) {
+                    return Err(sequence_mismatch(&last_pkt));
+                }
                 full_pkt.extend_from_slice(last_pkt.as_ref());
                 let final_pkt = full_pkt.freeze();
                 Ok((last_seq, Packet::from_bytes(final_pkt)))
@@ -362,7 +408,7 @@ pub(crate) fn packet<'a>(i: NomBytes) -> nom::IResult<NomBytes, (u8, Packet<'a>)
             (None, Some((last_seq, last_pkt))) => Ok((last_seq, Packet::from_bytes(last_pkt.0))),
             // TODO: might know length
             (None, None) => Err(nom::Err::Incomplete(Needed::Unknown)),
-        },
+        }},
     )(i)
     .map(|(rest, parsed)| match parsed {
         Ok(parsed) => Ok((rest, parsed)),

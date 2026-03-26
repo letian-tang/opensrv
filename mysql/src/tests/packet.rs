@@ -63,3 +63,16 @@ fn test_long_more() {
     assert_eq!(&p.1[..U24_MAX], &[0; U24_MAX][..]);
     assert_eq!(&p.1[U24_MAX..], &[0x10]);
 }
+
+#[test]
+fn test_long_invalid_sequence_returns_error() {
+    let mut data = vec![0xff, 0xff, 0xff, 0];
+    data.extend(&[0; U24_MAX][..]);
+    data.push(0x01);
+    data.push(0x00);
+    data.push(0x00);
+    data.push(3);
+    data.push(0x10);
+
+    assert!(packet((&data[..]).into()).is_err());
+}
