@@ -1,20 +1,20 @@
 # OpenSrv - MySQL
 
-**Bindings for emulating a MySQL/MariaDB server.**
+基于 [databendlabs/opensrv](https://github.com/databendlabs/opensrv) 修改而来，包含针对真实客户端接入的稳定性修复与兼容性增强。
 
-When developing new databases or caching layers, it can be immensely useful to test your system
-using existing applications. However, this often requires significant work modifying
-applications to use your database over the existing ones. This crate solves that problem by
-acting as a MySQL server, and delegating operations such as querying and query execution to
-user-defined logic.
+这个 crate 用于模拟 MySQL/MariaDB 服务端协议。你只需要实现 `AsyncMysqlShim`，就可以把自己的后端能力暴露给 MySQL 客户端，例如 JDBC、Navicat、DBeaver、MySQL CLI 等。
 
-## Usage
+## 主要特性
 
-To start, implement `AsyncMysqlShim` for your backend, and create a `AsyncMysqlIntermediary` over an
-instance of your backend and a connection stream. The appropriate methods will be called on
-your backend whenever a client issues a `QUERY`, `PREPARE`, or `EXECUTE` command, and you will
-have a chance to respond appropriately. For example, to write a shim that always responds to
-all commands with a "no results" reply:
+- 支持文本查询与预处理语句
+- 支持 `mysql_native_password`
+- 支持 `caching_sha2_password`
+- 支持 TLS
+- 提供更适合生产使用的 buffered 运行入口
+
+## 基本用法
+
+先为你的后端实现 `AsyncMysqlShim`，然后通过 `AsyncMysqlIntermediary` 处理连接。
 
 ```rust
 use std::io;
@@ -65,34 +65,40 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     loop {
         let (stream, _) = listener.accept().await?;
         let (r, w) = stream.into_split();
-        tokio::spawn(async move { AsyncMysqlIntermediary::run_on_buffered(Backend, r, w).await });
+        tokio::spawn(async move {
+            AsyncMysqlIntermediary::run_on_buffered(Backend, r, w).await
+        });
     }
 }
 ```
 
-This example can be exected with:
+运行示例：
 
+```bash
+cargo run --example serve_one
 ```
-cargo run --example=serve_one
-```
 
-More examples can be found [here](examples).
+更多示例见 [examples](./examples)。
 
-For production use, prefer `AsyncMysqlIntermediary::run_on_buffered(...)` or
-`run_with_options_buffered(...)` instead of wiring a bare stream directly. The buffered entrypoints
-add connection-level read/write buffering around the protocol layer and are more stable with
-real clients such as JDBC drivers.
+## 生产环境建议
 
-## Authentication and Compatibility
+建议优先使用：
 
-This crate supports plugin-auth handshakes and can be used with both MySQL 5.7-style
-`mysql_native_password` and MySQL 8.0-style `caching_sha2_password` clients.
+- `AsyncMysqlIntermediary::run_on_buffered(...)`
+- `AsyncMysqlIntermediary::run_with_options_buffered(...)`
 
-The default shim behavior remains `mysql_native_password`, but a backend can opt into
-`caching_sha2_password` per connection or per user by returning
-`CACHING_SHA2_PASSWORD` from `default_auth_plugin()` or `auth_plugin_for_username()`.
+这两个入口会在协议层外增加连接级读写缓冲，在 JDBC 等真实客户端场景下更稳定。
 
-Helpers are provided to validate client auth responses against a known password:
+## 认证与兼容性
+
+当前支持：
+
+- MySQL 5.7 常见认证方式 `mysql_native_password`
+- MySQL 8.0 常见插件认证 `caching_sha2_password`
+
+默认仍使用 `mysql_native_password`。如果你需要按连接或按用户切换到 `caching_sha2_password`，可以在 shim 中返回 `CACHING_SHA2_PASSWORD`。
+
+可以使用以下 helper 校验客户端发来的认证数据：
 
 ```rust
 use opensrv_mysql::verify_auth_plugin_data;
@@ -108,20 +114,11 @@ async fn authenticate(
 }
 ```
 
-Compatibility notes:
+兼容性说明：
 
-- MySQL 5.7 clients typically work with `mysql_native_password`.
-- MySQL 8.0 clients can work with either `mysql_native_password` or
-  `caching_sha2_password`, depending on what the server advertises.
-- If you want clients to identify the server as MySQL 8.0, override `version()` in your shim.
-
-## Getting help
-
-Submit [issues](https://github.com/datafuselabs/opensrv/issues/new/choose) for bug report or asking questions in [discussion](https://github.com/datafuselabs/opensrv/discussions/new?category=q-a).
-
-## Credits
-
-This project is a branch of [jonhoo/msql-srv](https://github.com/jonhoo/msql-srv) and focuses on providing asynchronous support.
+- MySQL 5.7 客户端通常可直接使用 `mysql_native_password`
+- MySQL 8.0 客户端可根据服务端声明使用 `mysql_native_password` 或 `caching_sha2_password`
+- 如果希望客户端将服务端识别为 MySQL 8.0，可以在 shim 中覆盖 `version()`
 
 ## License
 
