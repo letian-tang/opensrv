@@ -239,7 +239,7 @@ mod tests {
 
         assert_eq!(values.len(), 1);
         assert_eq!(values[0].coltype, ColumnType::MYSQL_TYPE_LONG);
-        assert_eq!(i32::from(values[0].value), 42);
+        assert_eq!(i32::try_from(values[0].value).unwrap(), 42);
     }
 
     #[test]

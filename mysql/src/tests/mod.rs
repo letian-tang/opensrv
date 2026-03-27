@@ -14,6 +14,7 @@
 
 mod auth;
 mod commands;
+mod intermediary;
 mod packet;
 mod value;
 mod writers;

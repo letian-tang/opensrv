@@ -680,7 +680,7 @@ async fn it_prepares() {
                     params[0].coltype,
                     myc::constants::ColumnType::MYSQL_TYPE_LONGLONG
                 );
-                assert_eq!(Into::<i8>::into(params[0].value), 42i8);
+                assert_eq!(<i8>::try_from(params[0].value).unwrap(), 42i8);
 
                 let mut w = w.start(&cols3).await?;
                 w.write_col(1024i16)?;
@@ -791,22 +791,22 @@ async fn insert_exec() {
                     params[6].coltype,
                     myc::constants::ColumnType::MYSQL_TYPE_VAR_STRING
                 );
-                assert_eq!(Into::<&str>::into(params[0].value), "user199");
-                assert_eq!(Into::<&str>::into(params[1].value), "user199@example.com");
+                assert_eq!(<&str>::try_from(params[0].value).unwrap(), "user199");
+                assert_eq!(<&str>::try_from(params[1].value).unwrap(), "user199@example.com");
                 assert_eq!(
-                    Into::<&str>::into(params[2].value),
+                    <&str>::try_from(params[2].value).unwrap(),
                     "$2a$10$Tq3wrGeC0xtgzuxqOlc3v.07VTUvxvwI70kuoVihoO2cE5qj7ooka"
                 );
                 assert_eq!(
-                    Into::<chrono::NaiveDateTime>::into(params[3].value),
+                    <chrono::NaiveDateTime>::try_from(params[3].value).unwrap(),
                     chrono::NaiveDate::from_ymd_opt(2018, 4, 6)
                         .unwrap()
                         .and_hms_opt(13, 0, 56)
                         .unwrap()
                 );
-                assert_eq!(Into::<&str>::into(params[4].value), "token199");
-                assert_eq!(Into::<&str>::into(params[5].value), "rsstoken199");
-                assert_eq!(Into::<&str>::into(params[6].value), "mtok199");
+                assert_eq!(<&str>::try_from(params[4].value).unwrap(), "token199");
+                assert_eq!(<&str>::try_from(params[5].value).unwrap(), "rsstoken199");
+                assert_eq!(<&str>::try_from(params[6].value).unwrap(), "mtok199");
 
                 let info = OkResponse {
                     affected_rows: 42,
@@ -885,7 +885,7 @@ async fn send_long() {
                     params[0].coltype,
                     myc::constants::ColumnType::MYSQL_TYPE_VAR_STRING
                 );
-                assert_eq!(Into::<&[u8]>::into(params[0].value), b"Hello world");
+                assert_eq!(<&[u8]>::try_from(params[0].value).unwrap(), b"Hello world");
 
                 let mut w = w.start(&cols).await?;
                 w.write_col(1024i16)?;
@@ -1100,7 +1100,7 @@ async fn prepared_nulls() {
                     params[1].coltype,
                     myc::constants::ColumnType::MYSQL_TYPE_LONGLONG
                 );
-                assert_eq!(Into::<i8>::into(params[1].value), 42i8);
+                assert_eq!(<i8>::try_from(params[1].value).unwrap(), 42i8);
 
                 let mut w = w.start(&cols).await?;
                 w.write_row(vec![None::<i16>, Some(42)]).await?;

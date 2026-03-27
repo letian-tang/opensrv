@@ -19,7 +19,7 @@ use std::iter::Enumerate;
 use std::marker::PhantomData;
 use std::ops::RangeFrom;
 
-use bytes::BytesMut;
+use bytes::{BufMut, BytesMut};
 use nom::Needed;
 use tokio::io::AsyncRead;
 use tokio::io::AsyncReadExt;
@@ -42,7 +42,7 @@ fn calc_new_buf_size(last_buf_size: usize) -> usize {
 /// return (the idx to start writing to the buffer,  and the buffer itself)
 ///
 /// will copy the remain bytes from the old buffer to the new buffer if reusing
-fn reuse_or_create_buf(old_buf: bytes::Bytes, last_buf_size: usize) -> (usize, BytesMut) {
+fn reuse_or_create_buf(old_buf: bytes::Bytes, last_buf_size: usize) -> BytesMut {
     let new_buf_size = calc_new_buf_size(last_buf_size);
     match old_buf.try_into_mut() {
         Ok(mut unique) => {
@@ -54,18 +54,38 @@ fn reuse_or_create_buf(old_buf: bytes::Bytes, last_buf_size: usize) -> (usize, B
                 new_buf_size
             };
             debug_assert!(len < resize_buf);
-            // resize will save old bytes unchanged and fill the rest with 0
-            unique.resize(resize_buf, 0);
-            (len, unique)
+            let required_capacity = resize_buf.saturating_sub(len);
+            unique.reserve(required_capacity);
+            unique
         }
         Err(remain) => {
             let mut buf = BytesMut::with_capacity(new_buf_size);
-            buf.resize(new_buf_size, 0);
             // if old buffer still contain bytes unread, need to save those bytes too
-            buf[0..remain.len()].copy_from_slice(&remain);
-            (remain.len(), buf)
+            buf.extend_from_slice(&remain);
+            buf
         }
     }
+}
+
+fn read_into_bytesmut<R: Read>(reader: &mut R, buf: &mut BytesMut) -> io::Result<usize> {
+    let spare = buf.spare_capacity_mut();
+    // Cap the read buffer to 64KB to avoid O(capacity) memset overhead
+    // on large unused capacities, while maintaining good read throughput.
+    let to_read = std::cmp::min(spare.len(), 65536);
+    let spare = &mut spare[..to_read];
+
+    // Safety: std::io::Read requires an initialized buffer.
+    unsafe {
+        std::ptr::write_bytes(spare.as_mut_ptr(), 0, spare.len());
+    }
+    let dst = unsafe {
+        std::slice::from_raw_parts_mut(spare.as_mut_ptr() as *mut u8, spare.len())
+    };
+    let read_cnt = reader.read(dst)?;
+    unsafe {
+        buf.advance_mut(read_cnt);
+    }
+    Ok(read_cnt)
 }
 
 pub struct PacketReader<R> {
@@ -107,10 +127,8 @@ impl<R: Read> PacketReader<R> {
             }
 
             // read more buffer
-            let (start, mut buf) =
-                reuse_or_create_buf(std::mem::take(&mut self.bytes), last_buffer_size);
-            let read_cnt = self.r.read(&mut buf[start..])?;
-            buf.truncate(start + read_cnt);
+            let mut buf = reuse_or_create_buf(std::mem::take(&mut self.bytes), last_buffer_size);
+            let read_cnt = read_into_bytesmut(&mut self.r, &mut buf)?;
             self.bytes = buf.freeze();
 
             // for a [TcpStream], returning zero indicates the connection was shut down correctly.
@@ -167,12 +185,8 @@ impl<R: AsyncRead + Unpin> PacketReader<R> {
             }
 
             // read more buffer
-            let (start, mut buf) =
-                reuse_or_create_buf(std::mem::take(&mut self.bytes), last_buffer_size);
-
-            let read_cnt = self.r.read(&mut buf[start..]).await?;
-            buf.truncate(start + read_cnt);
-
+            let mut buf = reuse_or_create_buf(std::mem::take(&mut self.bytes), last_buffer_size);
+            let read_cnt = self.r.read_buf(&mut buf).await?;
             self.bytes = buf.freeze();
 
             if read_cnt == 0 {

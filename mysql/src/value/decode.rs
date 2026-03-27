@@ -180,62 +180,90 @@ impl<'a> ValueInner<'a> {
     }
 }
 
-// NOTE: these should all be TryFrom
-macro_rules! impl_into {
+// NOTE: these are now TryFrom to avoid panics on invalid data
+macro_rules! impl_try_into_int {
     ($t:ty, $($variant:path),*) => {
-        impl<'a> From<Value<'a>> for $t {
-            fn from(val: Value<'a>) -> Self {
+        impl<'a> std::convert::TryFrom<Value<'a>> for $t {
+            type Error = io::Error;
+            fn try_from(val: Value<'a>) -> Result<Self, Self::Error> {
                 match val.0 {
-                    $($variant(v) => v as $t),*,
-                    v => panic!(concat!("invalid type conversion from {:?} to ", stringify!($t)), v)
+                    $($variant(v) => v.try_into().map_err(|_| io::Error::new(io::ErrorKind::InvalidData, format!("value out of bounds for {}", stringify!($t))))),*,
+                    v => Err(io::Error::new(io::ErrorKind::InvalidData, format!("invalid type conversion from {:?} to {}", v, stringify!($t))))
                 }
             }
         }
     }
 }
 
-impl_into!(u8, ValueInner::UInt, ValueInner::Int);
-impl_into!(u16, ValueInner::UInt, ValueInner::Int);
-impl_into!(u32, ValueInner::UInt, ValueInner::Int);
-impl_into!(u64, ValueInner::UInt);
-impl_into!(i8, ValueInner::UInt, ValueInner::Int);
-impl_into!(i16, ValueInner::UInt, ValueInner::Int);
-impl_into!(i32, ValueInner::UInt, ValueInner::Int);
-impl_into!(i64, ValueInner::Int);
-impl_into!(f32, ValueInner::Double);
-impl_into!(f64, ValueInner::Double);
-impl_into!(&'a [u8], ValueInner::Bytes);
+macro_rules! impl_try_into_float {
+    ($t:ty, $($variant:path),*) => {
+        impl<'a> std::convert::TryFrom<Value<'a>> for $t {
+            type Error = io::Error;
+            fn try_from(val: Value<'a>) -> Result<Self, Self::Error> {
+                match val.0 {
+                    $($variant(v) => Ok(v as $t)),*,
+                    v => Err(io::Error::new(io::ErrorKind::InvalidData, format!("invalid type conversion from {:?} to {}", v, stringify!($t))))
+                }
+            }
+        }
+    }
+}
 
-impl<'a> From<Value<'a>> for &'a str {
-    fn from(val: Value<'a>) -> Self {
+impl_try_into_int!(u8, ValueInner::UInt, ValueInner::Int);
+impl_try_into_int!(u16, ValueInner::UInt, ValueInner::Int);
+impl_try_into_int!(u32, ValueInner::UInt, ValueInner::Int);
+impl_try_into_int!(u64, ValueInner::UInt, ValueInner::Int);
+impl_try_into_int!(i8, ValueInner::UInt, ValueInner::Int);
+impl_try_into_int!(i16, ValueInner::UInt, ValueInner::Int);
+impl_try_into_int!(i32, ValueInner::UInt, ValueInner::Int);
+impl_try_into_int!(i64, ValueInner::UInt, ValueInner::Int);
+impl_try_into_float!(f32, ValueInner::Double);
+impl_try_into_float!(f64, ValueInner::Double);
+
+impl<'a> std::convert::TryFrom<Value<'a>> for &'a [u8] {
+    type Error = io::Error;
+    fn try_from(val: Value<'a>) -> Result<Self, Self::Error> {
+        match val.0 {
+            ValueInner::Bytes(v) => Ok(v),
+            v => Err(io::Error::new(io::ErrorKind::InvalidData, format!("invalid type conversion from {:?} to bytes", v))),
+        }
+    }
+}
+
+impl<'a> std::convert::TryFrom<Value<'a>> for &'a str {
+    type Error = io::Error;
+    fn try_from(val: Value<'a>) -> Result<Self, Self::Error> {
         if let ValueInner::Bytes(v) = val.0 {
-            ::std::str::from_utf8(v).unwrap()
+            ::std::str::from_utf8(v).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("invalid utf8: {}", e)))
         } else {
-            panic!("invalid type conversion from {:?} to string", val)
+            Err(io::Error::new(io::ErrorKind::InvalidData, format!("invalid type conversion from {:?} to string", val)))
         }
     }
 }
 
 use chrono::{NaiveDate, NaiveDateTime};
-impl<'a> From<Value<'a>> for NaiveDate {
-    fn from(val: Value<'a>) -> Self {
+impl<'a> std::convert::TryFrom<Value<'a>> for NaiveDate {
+    type Error = io::Error;
+    fn try_from(val: Value<'a>) -> Result<Self, Self::Error> {
         if let ValueInner::Date(mut v) = val.0 {
-            assert_eq!(v.len(), 4);
-            NaiveDate::from_ymd_opt(
-                i32::from(v.read_u16::<LittleEndian>().unwrap()),
-                u32::from(v.read_u8().unwrap()),
-                u32::from(v.read_u8().unwrap()),
-            )
-            .unwrap()
+            if v.len() != 4 {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid date length"));
+            }
+            let y = i32::from(v.read_u16::<LittleEndian>()?);
+            let m = u32::from(v.read_u8()?);
+            let d = u32::from(v.read_u8()?);
+            NaiveDate::from_ymd_opt(y, m, d)
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid date format"))
         } else {
-            panic!("invalid type conversion from {:?} to date", val)
+            Err(io::Error::new(io::ErrorKind::InvalidData, format!("invalid type conversion from {:?} to date", val)))
         }
     }
 }
 
-impl<'a> From<Value<'a>> for NaiveDateTime {
-    fn from(val: Value<'a>) -> Self {
-        to_naive_datetime(val).unwrap()
+impl<'a> std::convert::TryFrom<Value<'a>> for NaiveDateTime {
+    type Error = io::Error;
+    fn try_from(val: Value<'a>) -> Result<Self, Self::Error> {
+        to_naive_datetime(val)
     }
 }
 
@@ -316,36 +344,39 @@ pub fn to_naive_datetime(val: Value) -> Result<NaiveDateTime, io::Error> {
 
 use std::time::Duration;
 
-impl<'a> From<Value<'a>> for Duration {
-    fn from(val: Value<'a>) -> Self {
+impl<'a> std::convert::TryFrom<Value<'a>> for Duration {
+    type Error = io::Error;
+    fn try_from(val: Value<'a>) -> Result<Self, Self::Error> {
         if let ValueInner::Time(mut v) = val.0 {
-            assert!(v.is_empty() || v.len() == 8 || v.len() == 12);
+            if !v.is_empty() && v.len() != 8 && v.len() != 12 {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid time length"));
+            }
 
             if v.is_empty() {
-                return Duration::from_secs(0);
+                return Ok(Duration::from_secs(0));
             }
 
-            let neg = v.read_u8().unwrap();
+            let neg = v.read_u8()?;
             if neg != 0u8 {
-                unimplemented!();
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "negative time not supported as Duration"));
             }
 
-            let days = u64::from(v.read_u32::<LittleEndian>().unwrap());
-            let hours = u64::from(v.read_u8().unwrap());
-            let minutes = u64::from(v.read_u8().unwrap());
-            let seconds = u64::from(v.read_u8().unwrap());
+            let days = u64::from(v.read_u32::<LittleEndian>()?);
+            let hours = u64::from(v.read_u8()?);
+            let minutes = u64::from(v.read_u8()?);
+            let seconds = u64::from(v.read_u8()?);
             let micros = if v.len() == 12 {
-                v.read_u32::<LittleEndian>().unwrap()
+                v.read_u32::<LittleEndian>()?
             } else {
                 0
             };
 
-            Duration::new(
+            Ok(Duration::new(
                 days * 86_400 + hours * 3_600 + minutes * 60 + seconds,
                 micros * 1_000,
-            )
+            ))
         } else {
-            panic!("invalid type conversion from {:?} to datetime", val)
+            Err(io::Error::new(io::ErrorKind::InvalidData, format!("invalid type conversion from {:?} to duration", val)))
         }
     }
 }

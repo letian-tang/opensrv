@@ -27,7 +27,6 @@ extern crate mysql_common as myc;
 use std::collections::HashMap;
 use std::io;
 use std::io::Write;
-use std::iter;
 
 use async_trait::async_trait;
 use tokio::io::{AsyncRead, AsyncWrite, BufReader, BufWriter};
@@ -107,6 +106,42 @@ use crate::{commands::ClientHandshake, packet_reader::PacketReader, packet_write
 const SCRAMBLE_SIZE: usize = 20;
 pub const MYSQL_NATIVE_PASSWORD: &str = "mysql_native_password";
 pub const CACHING_SHA2_PASSWORD: &str = "caching_sha2_password";
+
+fn command_parse_error(packet: &[u8]) -> (ErrorKind, String) {
+    if packet.is_empty() {
+        (
+            ErrorKind::ER_MALFORMED_PACKET,
+            "malformed command packet".to_string(),
+        )
+    } else {
+        use crate::myc::constants::Command as CommandByte;
+        let cmd = packet[0];
+        let is_known = matches!(
+            cmd,
+            x if x == CommandByte::COM_QUERY as u8
+                || x == CommandByte::COM_FIELD_LIST as u8
+                || x == CommandByte::COM_INIT_DB as u8
+                || x == CommandByte::COM_STMT_PREPARE as u8
+                || x == CommandByte::COM_STMT_EXECUTE as u8
+                || x == CommandByte::COM_STMT_SEND_LONG_DATA as u8
+                || x == CommandByte::COM_STMT_CLOSE as u8
+                || x == CommandByte::COM_QUIT as u8
+                || x == CommandByte::COM_PING as u8
+        );
+
+        if is_known {
+            (
+                ErrorKind::ER_MALFORMED_PACKET,
+                format!("malformed packet for command: 0x{:02x}", cmd),
+            )
+        } else {
+            (
+                ErrorKind::ER_UNKNOWN_COM_ERROR,
+                format!("unsupported command: 0x{:02x}", cmd),
+            )
+        }
+    }
+}
 
 pub fn verify_mysql_native_password(password: &[u8], salt: &[u8], auth_data: &[u8]) -> bool {
     match scramble_native(salt, password) {
@@ -226,6 +261,38 @@ pub trait AsyncMysqlShim<W: Send> {
         query: &'a str,
         results: QueryResultWriter<'a, W>,
     ) -> Result<(), Self::Error>;
+
+    /// Called when the client issues a system variable query (e.g., `SELECT @@version_comment`).
+    ///
+    /// By default, it handles `max_allowed_packet` and `version_comment`, and delegates 
+    /// other variables to `on_query`. Implementors can override this to seamlessly handle
+    /// driver-specific initialization variables.
+    async fn on_system_variable<'a>(
+        &'a mut self,
+        query: &'a str,
+        results: QueryResultWriter<'a, W>,
+    ) -> Result<(), Self::Error>
+    where
+        W: tokio::io::AsyncWrite + Send + std::marker::Unpin,
+    {
+        let q = query.to_lowercase();
+        let var = &q["select @@".len()..];
+        if var == "max_allowed_packet" {
+            let cols = &[Column {
+                table: String::new(),
+                column: "@@max_allowed_packet".to_string(),
+                collen: 0,
+                coltype: myc::constants::ColumnType::MYSQL_TYPE_LONG,
+                colflags: myc::constants::ColumnFlags::UNSIGNED_FLAG,
+            }];
+            let mut w = results.start(cols).await.map_err(|e| e.into())?;
+            w.write_row(std::iter::once(67108864u32)).await.map_err(|e| e.into())?;
+            w.finish().await.map_err(|e| e.into())?;
+        } else {
+            self.on_query(query, results).await?;
+        }
+        Ok(())
+    }
 
     /// Called when client switches database.
     async fn on_init<'a>(
@@ -656,34 +723,14 @@ where
                                     false,
                                     self.client_capabilities,
                                 );
-
-                                let var = &q[b"SELECT @@".len()..];
-                                let var_with_at = &q[b"SELECT ".len()..];
-                                let cols = &[Column {
-                                    table: String::new(),
-                                    column: String::from_utf8_lossy(var_with_at).to_string(),
-                                    collen: 0,
-                                    coltype: myc::constants::ColumnType::MYSQL_TYPE_LONG,
-                                    colflags: myc::constants::ColumnFlags::UNSIGNED_FLAG,
-                                }];
-
-                                match var {
-                                    b"max_allowed_packet" => {
-                                        let mut w = w.start(cols).await?;
-                                        w.write_row(iter::once(67108864u32)).await?;
-                                        w.finish().await?;
-                                    }
-                                    _ => {
-                                        self.shim
-                                            .on_query(
-                                                ::std::str::from_utf8(q).map_err(|e| {
-                                                    io::Error::new(io::ErrorKind::InvalidData, e)
-                                                })?,
-                                                w,
-                                            )
-                                            .await?;
-                                    }
-                                }
+                                self.shim
+                                    .on_system_variable(
+                                        ::std::str::from_utf8(q).map_err(|e| {
+                                            io::Error::new(io::ErrorKind::InvalidData, e)
+                                        })?,
+                                        w,
+                                    )
+                                    .await?;
                             } else if !self.process_use_statement_on_query
                                 && (q.starts_with(b"USE ") || q.starts_with(b"use "))
                             {
@@ -813,14 +860,8 @@ where
                     self.writer.flush_all().await?;
                 }
                 Err(_) => {
-                    // if parser err, we need also stay the conn,
-                    // because we can not support all command.
-                    writers::write_ok_packet(
-                        &mut self.writer,
-                        self.client_capabilities,
-                        OkResponse::default(),
-                    )
-                    .await?;
+                    let (kind, msg) = command_parse_error(&packet);
+                    writers::write_err(kind, msg.as_bytes(), &mut self.writer).await?;
                     self.writer.flush_all().await?;
                 }
             }

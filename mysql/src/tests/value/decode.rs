@@ -42,7 +42,7 @@ macro_rules! rt {
             let v: $t = $v;
             myc::value::Value::from(v).serialize(&mut data);
             assert_eq!(
-                Into::<$t>::into(Value::parse_from(&mut &data[..], $ct, !$sig).unwrap()),
+                std::convert::TryInto::<$t>::try_into(Value::parse_from(&mut &data[..], $ct, !$sig).unwrap()).unwrap(),
                 v
             );
         }

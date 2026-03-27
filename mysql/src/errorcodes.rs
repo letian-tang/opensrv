@@ -85,7 +85,7 @@ fn main() {
     for &(code, _, ref name, _) in &es {
         println!("            {}_u16 => ErrorKind::{},", code, name);
     }
-    println!("            _ => panic!(\"Unknown error type {{}}\", x),");
+    println!("            _ => ErrorKind::ER_UNKNOWN_ERROR,");
     println!("        }}");
     println!("    }}");
     println!("}}");
@@ -2804,7 +2804,7 @@ impl From<u16> for ErrorKind {
             1883_u16 => ErrorKind::ER_PLUGIN_CANNOT_BE_UNINSTALLED,
             1884_u16 => ErrorKind::ER_GTID_UNSAFE_BINLOG_SPLITTABLE_STATEMENT_AND_GTID_GROUP,
             1885_u16 => ErrorKind::ER_SLAVE_HAS_MORE_GTIDS_THAN_MASTER,
-            _ => panic!("Unknown error type {}", x),
+            _ => ErrorKind::ER_UNKNOWN_ERROR,
         }
     }
 }
