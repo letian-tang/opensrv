@@ -209,7 +209,9 @@ async fn packet_writer_terminates_exact_multiple_with_empty_packet() {
     let (mut client, server) = duplex(U24_MAX + 16);
     let mut writer = PacketWriter::new(server);
 
-    writer.write_all(&vec![0u8; U24_MAX]).expect("write payload");
+    writer
+        .write_all(&vec![0u8; U24_MAX])
+        .expect("write payload");
     writer.end_packet().await.expect("finish packet");
 
     let mut header_buf = [0u8; 4];

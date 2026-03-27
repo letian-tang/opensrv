@@ -77,14 +77,13 @@ impl<'a> ParamParser<'a> {
                 let (typmap, rest) = input.split_at(type_map_len);
                 self.bound_types.clear();
                 for i in 0..self.params as usize {
-                    let coltype = myc::constants::ColumnType::try_from(typmap[2 * i]).map_err(
-                        |e| {
+                    let coltype =
+                        myc::constants::ColumnType::try_from(typmap[2 * i]).map_err(|e| {
                             io::Error::new(
                                 io::ErrorKind::InvalidData,
                                 format!("bad column type 0x{:x}: {}", typmap[2 * i], e),
                             )
-                        },
-                    )?;
+                        })?;
                     self.bound_types
                         .push((coltype, (typmap[2 * i + 1] & 128) != 0));
                 }
@@ -109,12 +108,13 @@ impl<'a> ParamParser<'a> {
                 continue;
             }
 
-            let (coltype, unsigned) = self.bound_types.get(col as usize).copied().ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("missing bound type for parameter {}", col),
-                )
-            })?;
+            let (coltype, unsigned) =
+                self.bound_types.get(col as usize).copied().ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("missing bound type for parameter {}", col),
+                    )
+                })?;
             Value::parse_from(&mut input, coltype, unsigned)?;
         }
 

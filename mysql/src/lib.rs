@@ -27,9 +27,11 @@ extern crate mysql_common as myc;
 use std::collections::HashMap;
 use std::io;
 use std::io::Write;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use tokio::io::{AsyncRead, AsyncWrite, BufReader, BufWriter};
+use tokio::time::timeout;
 #[cfg(feature = "tls")]
 use tokio_rustls::rustls::ServerConfig;
 
@@ -101,7 +103,11 @@ pub use crate::errorcodes::ErrorKind;
 pub use crate::params::{ParamParser, ParamValue, Params};
 pub use crate::resultset::{InitWriter, QueryResultWriter, RowWriter, StatementMetaWriter};
 pub use crate::value::{decode::to_naive_datetime, ToMysqlValue, Value, ValueInner};
-use crate::{commands::ClientHandshake, packet_reader::PacketReader, packet_writer::PacketWriter};
+use crate::{
+    commands::ClientHandshake,
+    packet_reader::{PacketReader, DEFAULT_MAX_PACKET_SIZE},
+    packet_writer::PacketWriter,
+};
 
 const SCRAMBLE_SIZE: usize = 20;
 pub const MYSQL_NATIVE_PASSWORD: &str = "mysql_native_password";
@@ -264,7 +270,7 @@ pub trait AsyncMysqlShim<W: Send> {
 
     /// Called when the client issues a system variable query (e.g., `SELECT @@version_comment`).
     ///
-    /// By default, it handles `max_allowed_packet` and `version_comment`, and delegates 
+    /// By default, it handles `max_allowed_packet` and `version_comment`, and delegates
     /// other variables to `on_query`. Implementors can override this to seamlessly handle
     /// driver-specific initialization variables.
     async fn on_system_variable<'a>(
@@ -286,7 +292,9 @@ pub trait AsyncMysqlShim<W: Send> {
                 colflags: myc::constants::ColumnFlags::UNSIGNED_FLAG,
             }];
             let mut w = results.start(cols).await.map_err(|e| e.into())?;
-            w.write_row(std::iter::once(67108864u32)).await.map_err(|e| e.into())?;
+            w.write_row(std::iter::once(67108864u32))
+                .await
+                .map_err(|e| e.into())?;
             w.finish().await.map_err(|e| e.into())?;
         } else {
             self.on_query(query, results).await?;
@@ -315,6 +323,14 @@ pub struct IntermediaryOptions {
     pub read_buffer_size: Option<usize>,
     /// Optional write buffer size for buffered convenience entrypoints.
     pub write_buffer_size: Option<usize>,
+    /// Hard protocol-layer ceiling for a single logical packet assembled from the wire.
+    pub max_packet_size: Option<usize>,
+    /// Optional timeout applied when waiting for the next client packet after authentication.
+    pub read_timeout: Option<Duration>,
+    /// Optional timeout applied during handshake and authentication packet exchange.
+    pub auth_timeout: Option<Duration>,
+    /// Flush underlying buffered writers once a packet payload reaches this threshold.
+    pub write_high_watermark: Option<usize>,
 }
 
 #[derive(Default)]
@@ -332,6 +348,8 @@ pub struct AsyncMysqlIntermediary<B, S: AsyncRead + Unpin, W> {
     pub(crate) client_capabilities: CapabilityFlags,
     process_use_statement_on_query: bool,
     reject_connection_on_dbname_absence: bool,
+    read_timeout: Option<Duration>,
+    auth_timeout: Option<Duration>,
     shim: B,
     reader: packet_reader::PacketReader<S>,
     writer: packet_writer::PacketWriter<W>,
@@ -369,22 +387,29 @@ where
         let process_use_statement_on_query = opts.process_use_statement_on_query;
         let reject_connection_on_dbname_absence = opts.reject_connection_on_dbname_absence;
         let (_, (handshake, seq, client_capabilities, input_stream)) =
-            AsyncMysqlIntermediary::init_before_ssl(
+            AsyncMysqlIntermediary::init_before_ssl_with_options(
                 &mut shim,
                 input_stream,
                 &mut output_stream,
+                opts,
                 #[cfg(feature = "tls")]
                 &None,
             )
             .await?;
 
-        let reader = PacketReader::new(input_stream);
-        let writer = PacketWriter::new(output_stream);
+        let reader = PacketReader::new_with_max_packet_size(
+            input_stream,
+            opts.max_packet_size.unwrap_or(DEFAULT_MAX_PACKET_SIZE),
+        );
+        let mut writer = PacketWriter::new(output_stream);
+        writer.set_flush_threshold(opts.write_high_watermark.unwrap_or(64 * 1024));
 
         let mut mi = AsyncMysqlIntermediary {
             client_capabilities,
             process_use_statement_on_query,
             reject_connection_on_dbname_absence,
+            read_timeout: opts.read_timeout,
+            auth_timeout: opts.auth_timeout,
             shim,
             reader,
             writer,
@@ -405,6 +430,30 @@ where
         ),
         B::Error,
     > {
+        Self::init_before_ssl_with_options(
+            shim,
+            input_stream,
+            output_stream,
+            &IntermediaryOptions::default(),
+            #[cfg(feature = "tls")]
+            tls_conf,
+        )
+        .await
+    }
+
+    pub async fn init_before_ssl_with_options(
+        shim: &mut B,
+        input_stream: R,
+        output_stream: &mut W,
+        opts: &IntermediaryOptions,
+        #[cfg(feature = "tls")] tls_conf: &Option<std::sync::Arc<ServerConfig>>,
+    ) -> Result<
+        (
+            bool,
+            (ClientHandshake, u8, CapabilityFlags, PacketReader<R>),
+        ),
+        B::Error,
+    > {
         let config = ServerHandshakeConfig {
             version: shim.version(),
             connection_id: shim.connect_id(),
@@ -412,10 +461,11 @@ where
             scramble: shim.salt(),
         };
 
-        AsyncMysqlIntermediary::<B, R, W>::init_before_ssl_with_config(
+        AsyncMysqlIntermediary::<B, R, W>::init_before_ssl_with_config_and_options(
             &config,
             input_stream,
             output_stream,
+            opts,
             #[cfg(feature = "tls")]
             tls_conf,
         )
@@ -432,8 +482,33 @@ where
         bool,
         (ClientHandshake, u8, CapabilityFlags, PacketReader<R>),
     )> {
-        let mut reader = PacketReader::new(input_stream);
+        Self::init_before_ssl_with_config_and_options(
+            config,
+            input_stream,
+            output_stream,
+            &IntermediaryOptions::default(),
+            #[cfg(feature = "tls")]
+            tls_conf,
+        )
+        .await
+    }
+
+    pub async fn init_before_ssl_with_config_and_options(
+        config: &ServerHandshakeConfig,
+        input_stream: R,
+        output_stream: &mut W,
+        opts: &IntermediaryOptions,
+        #[cfg(feature = "tls")] tls_conf: &Option<std::sync::Arc<ServerConfig>>,
+    ) -> io::Result<(
+        bool,
+        (ClientHandshake, u8, CapabilityFlags, PacketReader<R>),
+    )> {
+        let mut reader = PacketReader::new_with_max_packet_size(
+            input_stream,
+            opts.max_packet_size.unwrap_or(DEFAULT_MAX_PACKET_SIZE),
+        );
         let mut writer = PacketWriter::new(output_stream);
+        writer.set_flush_threshold(opts.write_high_watermark.unwrap_or(64 * 1024));
         // https://dev.mysql.com/doc/internals/en/connection-phase-packets.html#packet-Protocol::HandshakeV10
         writer.write_all(&[10])?; // protocol 10
 
@@ -490,12 +565,14 @@ where
         writer.end_packet().await?;
         writer.flush_all().await?;
 
-        let (seq, handshake) = reader.next_async().await?.ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::ConnectionAborted,
-                "peer terminated connection",
-            )
-        })?;
+        let (seq, handshake) = read_packet_with_timeout(&mut reader, opts.auth_timeout)
+            .await?
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::ConnectionAborted,
+                    "peer terminated connection",
+                )
+            })?;
 
         let handshake = commands::client_handshake(&handshake, false)
             .map_err(|e| match e {
@@ -552,12 +629,14 @@ where
     ) -> Result<(), B::Error> {
         #[cfg(feature = "tls")]
         if handshake.capabilities.contains(CapabilityFlags::CLIENT_SSL) {
-            let (_seq, hs) = self.reader.next_async().await?.ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::ConnectionAborted,
-                    "peer terminated connection",
-                )
-            })?;
+            let (_seq, hs) = read_packet_with_timeout(&mut self.reader, self.auth_timeout)
+                .await?
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::ConnectionAborted,
+                        "peer terminated connection",
+                    )
+                })?;
             seq = _seq;
 
             handshake = commands::client_handshake(&hs, true)
@@ -625,12 +704,14 @@ where
 
                     {
                         let (rseq, auth_response_data) =
-                            self.reader.next_async().await?.ok_or_else(|| {
-                                io::Error::new(
-                                    io::ErrorKind::ConnectionAborted,
-                                    "peer terminated connection",
-                                )
-                            })?;
+                            read_packet_with_timeout(&mut self.reader, self.auth_timeout)
+                                .await?
+                                .ok_or_else(|| {
+                                    io::Error::new(
+                                        io::ErrorKind::ConnectionAborted,
+                                        "peer terminated connection",
+                                    )
+                                })?;
 
                         seq = rseq;
                         auth_response = auth_response_data.to_vec();
@@ -710,7 +791,9 @@ where
         use crate::commands::Command;
 
         let mut stmts: HashMap<u32, _> = HashMap::new();
-        while let Some((seq, packet)) = self.reader.next_async().await? {
+        while let Some((seq, packet)) =
+            read_packet_with_timeout(&mut self.reader, self.read_timeout).await?
+        {
             self.writer.set_seq(seq + 1);
             let res = commands::parse(&packet);
             match res {
@@ -867,6 +950,26 @@ where
             }
         }
         Ok(())
+    }
+}
+
+async fn read_packet_with_timeout<R: AsyncRead + Unpin>(
+    reader: &mut PacketReader<R>,
+    timeout_duration: Option<Duration>,
+) -> io::Result<Option<(u8, packet_reader::Packet<'_>)>> {
+    if let Some(timeout_duration) = timeout_duration {
+        match timeout(timeout_duration, reader.next_async()).await {
+            Ok(result) => result,
+            Err(_) => Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!(
+                    "timed out waiting for client packet after {:?}",
+                    timeout_duration
+                ),
+            )),
+        }
+    } else {
+        reader.next_async().await
     }
 }
 

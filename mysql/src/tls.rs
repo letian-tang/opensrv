@@ -40,8 +40,13 @@ where
     W: AsyncWrite + Send + Unpin,
 {
     let (handshake, seq, client_capabilities, reader) = init_params;
-    let reader = PacketReader::new(reader);
-    let writer = PacketWriter::new(writer);
+    let reader = PacketReader::new_with_max_packet_size(
+        reader,
+        opts.max_packet_size
+            .unwrap_or(crate::packet_reader::DEFAULT_MAX_PACKET_SIZE),
+    );
+    let mut writer = PacketWriter::new(writer);
+    writer.set_flush_threshold(opts.write_high_watermark.unwrap_or(64 * 1024));
 
     let process_use_statement_on_query = opts.process_use_statement_on_query;
     let reject_connection_on_dbname_absence = opts.reject_connection_on_dbname_absence;
@@ -49,6 +54,8 @@ where
         client_capabilities,
         process_use_statement_on_query,
         reject_connection_on_dbname_absence,
+        read_timeout: opts.read_timeout,
+        auth_timeout: opts.auth_timeout,
         shim,
         reader,
         writer,
@@ -71,8 +78,13 @@ where
 {
     let (handshake, seq, client_capabilities, reader) = init_params;
     let (reader, writer) = switch_to_tls(tls_config, reader, writer).await?;
-    let reader = PacketReader::new(reader);
-    let writer = PacketWriter::new(writer);
+    let reader = PacketReader::new_with_max_packet_size(
+        reader,
+        opts.max_packet_size
+            .unwrap_or(crate::packet_reader::DEFAULT_MAX_PACKET_SIZE),
+    );
+    let mut writer = PacketWriter::new(writer);
+    writer.set_flush_threshold(opts.write_high_watermark.unwrap_or(64 * 1024));
 
     let process_use_statement_on_query = opts.process_use_statement_on_query;
     let reject_connection_on_dbname_absence = opts.reject_connection_on_dbname_absence;
@@ -80,6 +92,8 @@ where
         client_capabilities,
         process_use_statement_on_query,
         reject_connection_on_dbname_absence,
+        read_timeout: opts.read_timeout,
+        auth_timeout: opts.auth_timeout,
         shim,
         reader,
         writer,

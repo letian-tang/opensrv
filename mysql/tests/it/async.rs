@@ -792,7 +792,10 @@ async fn insert_exec() {
                     myc::constants::ColumnType::MYSQL_TYPE_VAR_STRING
                 );
                 assert_eq!(<&str>::try_from(params[0].value).unwrap(), "user199");
-                assert_eq!(<&str>::try_from(params[1].value).unwrap(), "user199@example.com");
+                assert_eq!(
+                    <&str>::try_from(params[1].value).unwrap(),
+                    "user199@example.com"
+                );
                 assert_eq!(
                     <&str>::try_from(params[2].value).unwrap(),
                     "$2a$10$Tq3wrGeC0xtgzuxqOlc3v.07VTUvxvwI70kuoVihoO2cE5qj7ooka"

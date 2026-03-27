@@ -26,6 +26,7 @@ use tokio::io::AsyncReadExt;
 
 const PACKET_BUFFER_SIZE: usize = 4_096;
 const PACKET_LARGE_BUFFER_SIZE: usize = 1_048_576;
+pub const DEFAULT_MAX_PACKET_SIZE: usize = 1024 * 1024 * 1024;
 
 /// Calculate the new buffer size for the next read
 fn calc_new_buf_size(last_buf_size: usize) -> usize {
@@ -78,9 +79,7 @@ fn read_into_bytesmut<R: Read>(reader: &mut R, buf: &mut BytesMut) -> io::Result
     unsafe {
         std::ptr::write_bytes(spare.as_mut_ptr(), 0, spare.len());
     }
-    let dst = unsafe {
-        std::slice::from_raw_parts_mut(spare.as_mut_ptr() as *mut u8, spare.len())
-    };
+    let dst = unsafe { std::slice::from_raw_parts_mut(spare.as_mut_ptr() as *mut u8, spare.len()) };
     let read_cnt = reader.read(dst)?;
     unsafe {
         buf.advance_mut(read_cnt);
@@ -91,13 +90,33 @@ fn read_into_bytesmut<R: Read>(reader: &mut R, buf: &mut BytesMut) -> io::Result
 pub struct PacketReader<R> {
     bytes: bytes::Bytes,
     pub r: R,
+    max_packet_size: usize,
 }
 
 impl<R> PacketReader<R> {
     pub fn new(r: R) -> Self {
+        Self::new_with_max_packet_size(r, DEFAULT_MAX_PACKET_SIZE)
+    }
+
+    pub fn new_with_max_packet_size(r: R, max_packet_size: usize) -> Self {
         PacketReader {
             bytes: bytes::Bytes::new(),
             r,
+            max_packet_size,
+        }
+    }
+
+    fn ensure_packet_limit(&self, buffered: usize) -> io::Result<()> {
+        if buffered > self.max_packet_size {
+            Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "packet exceeds configured limit: buffered {} bytes > limit {} bytes",
+                    buffered, self.max_packet_size
+                ),
+            ))
+        } else {
+            Ok(())
         }
     }
 }
@@ -130,6 +149,7 @@ impl<R: Read> PacketReader<R> {
             let mut buf = reuse_or_create_buf(std::mem::take(&mut self.bytes), last_buffer_size);
             let read_cnt = read_into_bytesmut(&mut self.r, &mut buf)?;
             self.bytes = buf.freeze();
+            self.ensure_packet_limit(self.bytes.len())?;
 
             // for a [TcpStream], returning zero indicates the connection was shut down correctly.
             if read_cnt == 0 {
@@ -188,6 +208,7 @@ impl<R: AsyncRead + Unpin> PacketReader<R> {
             let mut buf = reuse_or_create_buf(std::mem::take(&mut self.bytes), last_buffer_size);
             let read_cnt = self.r.read_buf(&mut buf).await?;
             self.bytes = buf.freeze();
+            self.ensure_packet_limit(self.bytes.len())?;
 
             if read_cnt == 0 {
                 if self.bytes.is_empty() {
@@ -365,11 +386,7 @@ pub(crate) fn packet<'a>(i: NomBytes) -> nom::IResult<NomBytes, (u8, Packet<'a>)
                         None::<nom::Err<nom::error::Error<NomBytes>>>,
                     )
                 },
-                |(
-                    seq,
-                    pkt,
-                    err,
-                ): (
+                |(seq, pkt, err): (
                     u8,
                     Option<BytesMut>,
                     Option<nom::Err<nom::error::Error<NomBytes>>>,
@@ -394,10 +411,7 @@ pub(crate) fn packet<'a>(i: NomBytes) -> nom::IResult<NomBytes, (u8, Packet<'a>)
             ),
             nom::combinator::opt(onepacket),
         ),
-        move |(
-            (full_seq, full_pkt, err),
-            last,
-        ): (
+        move |((full_seq, full_pkt, err), last): (
             (
                 u8,
                 Option<BytesMut>,
@@ -410,19 +424,22 @@ pub(crate) fn packet<'a>(i: NomBytes) -> nom::IResult<NomBytes, (u8, Packet<'a>)
             }
 
             match (full_pkt, last) {
-            (Some(mut full_pkt), Some((last_seq, last_pkt))) => {
-                if last_seq != full_seq.wrapping_add(1) {
-                    return Err(sequence_mismatch(&last_pkt));
+                (Some(mut full_pkt), Some((last_seq, last_pkt))) => {
+                    if last_seq != full_seq.wrapping_add(1) {
+                        return Err(sequence_mismatch(&last_pkt));
+                    }
+                    full_pkt.extend_from_slice(last_pkt.as_ref());
+                    let final_pkt = full_pkt.freeze();
+                    Ok((last_seq, Packet::from_bytes(final_pkt)))
                 }
-                full_pkt.extend_from_slice(last_pkt.as_ref());
-                let final_pkt = full_pkt.freeze();
-                Ok((last_seq, Packet::from_bytes(final_pkt)))
+                (Some(full_pkt), None) => Ok((full_seq, Packet::from_bytes(full_pkt.freeze()))),
+                (None, Some((last_seq, last_pkt))) => {
+                    Ok((last_seq, Packet::from_bytes(last_pkt.0)))
+                }
+                // TODO: might know length
+                (None, None) => Err(nom::Err::Incomplete(Needed::Unknown)),
             }
-            (Some(full_pkt), None) => Ok((full_seq, Packet::from_bytes(full_pkt.freeze()))),
-            (None, Some((last_seq, last_pkt))) => Ok((last_seq, Packet::from_bytes(last_pkt.0))),
-            // TODO: might know length
-            (None, None) => Err(nom::Err::Incomplete(Needed::Unknown)),
-        }},
+        },
     )(i)
     .map(|(rest, parsed)| match parsed {
         Ok(parsed) => Ok((rest, parsed)),
@@ -433,6 +450,7 @@ pub(crate) fn packet<'a>(i: NomBytes) -> nom::IResult<NomBytes, (u8, Packet<'a>)
 #[cfg(test)]
 mod test {
     use bytes::{Buf, BufMut};
+    use std::io;
 
     use super::*;
 
@@ -520,5 +538,22 @@ mod test {
             }
             assert_eq!(total_size, input_size);
         }
+    }
+
+    #[test]
+    fn next_rejects_packets_above_limit() {
+        let payload = bytes::Bytes::from(vec![1u8; 32]);
+        let packet = mock_packet(payload, 0);
+        let mut reader = PacketReader::new_with_max_packet_size(packet.reader(), 16);
+
+        let err = match reader.next() {
+            Ok(value) => panic!(
+                "packet larger than configured limit must fail, got {:?}",
+                value.map(|(seq, _)| seq)
+            ),
+            Err(err) => err,
+        };
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("packet exceeds configured limit"));
     }
 }

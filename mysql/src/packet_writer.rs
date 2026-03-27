@@ -27,6 +27,7 @@ use tokio::io::{AsyncWrite, AsyncWriteExt};
 pub struct PacketWriter<W> {
     packet_builder: PacketBuilder,
     output_stream: W,
+    flush_threshold: usize,
 }
 
 // exports the internal builder as sync Write
@@ -45,10 +46,15 @@ impl<W> PacketWriter<W> {
         Self {
             packet_builder: PacketBuilder::new(),
             output_stream,
+            flush_threshold: 64 * 1024,
         }
     }
     pub fn set_seq(&mut self, seq: u8) {
         self.packet_builder.set_seq(seq)
+    }
+
+    pub fn set_flush_threshold(&mut self, flush_threshold: usize) {
+        self.flush_threshold = flush_threshold;
     }
 }
 
@@ -97,6 +103,7 @@ impl<W: AsyncWrite + Unpin> PacketWriter<W> {
         if !self.packet_builder.is_empty() {
             let raw_packet = self.packet_builder.take_buffer();
             let needs_empty_packet = raw_packet.len() % U24_MAX == 0;
+            let should_flush = self.flush_threshold > 0 && raw_packet.len() >= self.flush_threshold;
 
             // split the raw buffer at the boundary of size U24_MAX
             for chunk in raw_packet.chunks(U24_MAX) {
@@ -106,6 +113,10 @@ impl<W: AsyncWrite + Unpin> PacketWriter<W> {
             // Exact multiples of U24_MAX must be terminated by an empty packet.
             if needs_empty_packet {
                 self.write_chunk(&[]).await?;
+            }
+
+            if should_flush {
+                self.output_stream.flush().await?;
             }
 
             Ok(())
@@ -177,6 +188,7 @@ mod tests {
     struct PartialAsyncWrite {
         written: Vec<u8>,
         max_bytes_per_call: usize,
+        flushes: usize,
     }
 
     impl PartialAsyncWrite {
@@ -184,6 +196,7 @@ mod tests {
             Self {
                 written: Vec::new(),
                 max_bytes_per_call,
+                flushes: 0,
             }
         }
     }
@@ -199,7 +212,8 @@ mod tests {
             Poll::Ready(Ok(written))
         }
 
-        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        fn poll_flush(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            self.flushes += 1;
             Poll::Ready(Ok(()))
         }
 
@@ -240,5 +254,15 @@ mod tests {
         let output = &writer.output_stream.written;
         assert_eq!(&output[..4], &[11, 0, 0, 0]);
         assert_eq!(&output[4..], b"hello world");
+    }
+
+    #[tokio::test]
+    async fn end_packet_flushes_when_payload_crosses_threshold() {
+        let mut writer = PacketWriter::new(PartialAsyncWrite::new(1024));
+        writer.set_flush_threshold(4);
+        writer.write_all(b"hello world").unwrap();
+        writer.end_packet().await.unwrap();
+
+        assert_eq!(writer.output_stream.flushes, 1);
     }
 }

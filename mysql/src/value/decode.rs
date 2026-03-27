@@ -225,7 +225,10 @@ impl<'a> std::convert::TryFrom<Value<'a>> for &'a [u8] {
     fn try_from(val: Value<'a>) -> Result<Self, Self::Error> {
         match val.0 {
             ValueInner::Bytes(v) => Ok(v),
-            v => Err(io::Error::new(io::ErrorKind::InvalidData, format!("invalid type conversion from {:?} to bytes", v))),
+            v => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("invalid type conversion from {:?} to bytes", v),
+            )),
         }
     }
 }
@@ -234,9 +237,14 @@ impl<'a> std::convert::TryFrom<Value<'a>> for &'a str {
     type Error = io::Error;
     fn try_from(val: Value<'a>) -> Result<Self, Self::Error> {
         if let ValueInner::Bytes(v) = val.0 {
-            ::std::str::from_utf8(v).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("invalid utf8: {}", e)))
+            ::std::str::from_utf8(v).map_err(|e| {
+                io::Error::new(io::ErrorKind::InvalidData, format!("invalid utf8: {}", e))
+            })
         } else {
-            Err(io::Error::new(io::ErrorKind::InvalidData, format!("invalid type conversion from {:?} to string", val)))
+            Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("invalid type conversion from {:?} to string", val),
+            ))
         }
     }
 }
@@ -247,7 +255,10 @@ impl<'a> std::convert::TryFrom<Value<'a>> for NaiveDate {
     fn try_from(val: Value<'a>) -> Result<Self, Self::Error> {
         if let ValueInner::Date(mut v) = val.0 {
             if v.len() != 4 {
-                return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid date length"));
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "invalid date length",
+                ));
             }
             let y = i32::from(v.read_u16::<LittleEndian>()?);
             let m = u32::from(v.read_u8()?);
@@ -255,7 +266,10 @@ impl<'a> std::convert::TryFrom<Value<'a>> for NaiveDate {
             NaiveDate::from_ymd_opt(y, m, d)
                 .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid date format"))
         } else {
-            Err(io::Error::new(io::ErrorKind::InvalidData, format!("invalid type conversion from {:?} to date", val)))
+            Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("invalid type conversion from {:?} to date", val),
+            ))
         }
     }
 }
@@ -349,7 +363,10 @@ impl<'a> std::convert::TryFrom<Value<'a>> for Duration {
     fn try_from(val: Value<'a>) -> Result<Self, Self::Error> {
         if let ValueInner::Time(mut v) = val.0 {
             if !v.is_empty() && v.len() != 8 && v.len() != 12 {
-                return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid time length"));
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "invalid time length",
+                ));
             }
 
             if v.is_empty() {
@@ -358,7 +375,10 @@ impl<'a> std::convert::TryFrom<Value<'a>> for Duration {
 
             let neg = v.read_u8()?;
             if neg != 0u8 {
-                return Err(io::Error::new(io::ErrorKind::InvalidData, "negative time not supported as Duration"));
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "negative time not supported as Duration",
+                ));
             }
 
             let days = u64::from(v.read_u32::<LittleEndian>()?);
@@ -376,7 +396,10 @@ impl<'a> std::convert::TryFrom<Value<'a>> for Duration {
                 micros * 1_000,
             ))
         } else {
-            Err(io::Error::new(io::ErrorKind::InvalidData, format!("invalid type conversion from {:?} to duration", val)))
+            Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("invalid type conversion from {:?} to duration", val),
+            ))
         }
     }
 }
