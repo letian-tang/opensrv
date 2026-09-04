@@ -110,6 +110,7 @@ use crate::{
 };
 
 const SCRAMBLE_SIZE: usize = 20;
+const CACHING_SHA2_DIGEST_LENGTH: usize = 32;
 pub const MYSQL_NATIVE_PASSWORD: &str = "mysql_native_password";
 pub const CACHING_SHA2_PASSWORD: &str = "caching_sha2_password";
 
@@ -131,6 +132,7 @@ fn command_parse_error(packet: &[u8]) -> (ErrorKind, String) {
                 || x == CommandByte::COM_STMT_EXECUTE as u8
                 || x == CommandByte::COM_STMT_SEND_LONG_DATA as u8
                 || x == CommandByte::COM_STMT_CLOSE as u8
+                || x == CommandByte::COM_STMT_RESET as u8
                 || x == CommandByte::COM_QUIT as u8
                 || x == CommandByte::COM_PING as u8
         );
@@ -218,7 +220,10 @@ pub trait AsyncMysqlShim<W: Send> {
         scramble
     }
 
-    /// authenticate method for the specified plugin
+    /// Authenticate using the specified plugin.
+    ///
+    /// `caching_sha2_password` is supported only through its fast-authentication
+    /// exchange. Return `false` if full authentication would be required.
     async fn authenticate(
         &self,
         _auth_plugin: &str,
@@ -291,11 +296,9 @@ pub trait AsyncMysqlShim<W: Send> {
                 coltype: myc::constants::ColumnType::MYSQL_TYPE_LONG,
                 colflags: myc::constants::ColumnFlags::UNSIGNED_FLAG,
             }];
-            let mut w = results.start(cols).await.map_err(|e| e.into())?;
-            w.write_row(std::iter::once(67108864u32))
-                .await
-                .map_err(|e| e.into())?;
-            w.finish().await.map_err(|e| e.into())?;
+            let mut w = results.start(cols).await?;
+            w.write_row(std::iter::once(67108864u32)).await?;
+            w.finish().await?;
         } else {
             self.on_query(query, results).await?;
         }
@@ -306,9 +309,12 @@ pub trait AsyncMysqlShim<W: Send> {
     async fn on_init<'a>(
         &'a mut self,
         _: &'a str,
-        _: InitWriter<'a, W>,
-    ) -> Result<(), Self::Error> {
-        Ok(())
+        writer: InitWriter<'a, W>,
+    ) -> Result<(), Self::Error>
+    where
+        W: AsyncWrite + Unpin,
+    {
+        writer.ok().await.map_err(Into::into)
     }
 }
 
@@ -324,6 +330,7 @@ pub struct IntermediaryOptions {
     /// Optional write buffer size for buffered convenience entrypoints.
     pub write_buffer_size: Option<usize>,
     /// Hard protocol-layer ceiling for a single logical packet assembled from the wire.
+    /// This also bounds accumulated `COM_STMT_SEND_LONG_DATA` bytes per statement.
     pub max_packet_size: Option<usize>,
     /// Optional timeout applied when waiting for the next client packet after authentication.
     pub read_timeout: Option<Duration>,
@@ -338,6 +345,7 @@ struct StatementData {
     long_data: HashMap<u16, Vec<u8>>,
     bound_types: Vec<(myc::constants::ColumnType, bool)>,
     params: u16,
+    pending_error: Option<(ErrorKind, String)>,
 }
 
 const AUTH_PLUGIN_DATA_PART_1_LENGTH: usize = 8;
@@ -350,6 +358,7 @@ pub struct AsyncMysqlIntermediary<B, S: AsyncRead + Unpin, W> {
     reject_connection_on_dbname_absence: bool,
     read_timeout: Option<Duration>,
     auth_timeout: Option<Duration>,
+    max_long_data_size: usize,
     shim: B,
     reader: packet_reader::PacketReader<S>,
     writer: packet_writer::PacketWriter<W>,
@@ -386,6 +395,7 @@ where
     ) -> Result<(), B::Error> {
         let process_use_statement_on_query = opts.process_use_statement_on_query;
         let reject_connection_on_dbname_absence = opts.reject_connection_on_dbname_absence;
+        let max_long_data_size = opts.max_packet_size.unwrap_or(DEFAULT_MAX_PACKET_SIZE);
         let (_, (handshake, seq, client_capabilities, input_stream)) =
             AsyncMysqlIntermediary::init_before_ssl_with_options(
                 &mut shim,
@@ -410,6 +420,7 @@ where
             reject_connection_on_dbname_absence,
             read_timeout: opts.read_timeout,
             auth_timeout: opts.auth_timeout,
+            max_long_data_size,
             shim,
             reader,
             writer,
@@ -602,7 +613,7 @@ where
             })?
             .1;
 
-        writer.set_seq(seq + 1);
+        writer.set_seq(seq.wrapping_add(1));
 
         #[cfg(not(feature = "tls"))]
         if handshake.capabilities.contains(CapabilityFlags::CLIENT_SSL) {
@@ -667,7 +678,7 @@ where
                 })?
                 .1;
 
-            self.writer.set_seq(seq + 1);
+            self.writer.set_seq(seq.wrapping_add(1));
         }
 
         let scramble = self.shim.salt();
@@ -692,7 +703,7 @@ where
                 if !auth_plugin_expect.is_empty()
                     && handshake.auth_plugin != auth_plugin_expect.as_bytes()
                 {
-                    self.writer.set_seq(seq + 1);
+                    self.writer.set_seq(seq.wrapping_add(1));
                     self.writer.write_all(&[0xfe])?;
                     self.writer.write_all(auth_plugin_expect.as_bytes())?;
                     self.writer.write_all(&[0x00])?;
@@ -718,7 +729,26 @@ where
                     }
                 }
 
-                self.writer.set_seq(seq + 1);
+                self.writer.set_seq(seq.wrapping_add(1));
+
+                if auth_plugin_expect == CACHING_SHA2_PASSWORD
+                    && !auth_response.is_empty()
+                    && auth_response.len() != CACHING_SHA2_DIGEST_LENGTH
+                {
+                    let err_msg = format!(
+                        "Authenticate failed, user: {:?}, auth_plugin: {:?}",
+                        String::from_utf8_lossy(username),
+                        auth_plugin_expect,
+                    );
+                    writers::write_err(
+                        ErrorKind::ER_ACCESS_DENIED_NO_PASSWORD_ERROR,
+                        err_msg.as_bytes(),
+                        &mut self.writer,
+                    )
+                    .await?;
+                    self.writer.flush_all().await?;
+                    return Err(io::Error::new(io::ErrorKind::PermissionDenied, err_msg).into());
+                }
 
                 if !self
                     .shim
@@ -743,6 +773,15 @@ where
                     .await?;
                     self.writer.flush_all().await?;
                     return Err(io::Error::new(io::ErrorKind::PermissionDenied, err_msg).into());
+                }
+
+                if auth_plugin_expect == CACHING_SHA2_PASSWORD
+                    && auth_response.len() == CACHING_SHA2_DIGEST_LENGTH
+                {
+                    // A valid caching_sha2_password scramble completes only the fast-auth
+                    // phase. The protocol requires AuthMoreData(0x03) before the final OK.
+                    self.writer.write_all(&[0x01, 0x03])?;
+                    self.writer.end_packet().await?;
                 }
 
                 let mut needs_default_ok = true;
@@ -794,35 +833,55 @@ where
         while let Some((seq, packet)) =
             read_packet_with_timeout(&mut self.reader, self.read_timeout).await?
         {
-            self.writer.set_seq(seq + 1);
+            if packet.first_sequence_id() != 0 {
+                self.writer.set_seq(seq.wrapping_add(1));
+                writers::write_err(
+                    ErrorKind::ER_MALFORMED_PACKET,
+                    b"command packet sequence id must start at 0",
+                    &mut self.writer,
+                )
+                .await?;
+                self.writer.flush_all().await?;
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "command packet sequence id must start at 0",
+                )
+                .into());
+            }
+            self.writer.set_seq(seq.wrapping_add(1));
             let res = commands::parse(&packet);
             match res {
                 Ok(cmd) => {
                     match cmd.1 {
                         Command::Query(q) => {
-                            if q.starts_with(b"SELECT @@") || q.starts_with(b"select @@") {
+                            let q_str = match ::std::str::from_utf8(q) {
+                                Ok(s) => s,
+                                Err(e) => {
+                                    writers::write_err(
+                                        ErrorKind::ER_MALFORMED_PACKET,
+                                        format!("query is not valid utf-8: {}", e).as_bytes(),
+                                        &mut self.writer,
+                                    )
+                                    .await?;
+                                    self.writer.flush_all().await?;
+                                    continue;
+                                }
+                            };
+                            if q_str.starts_with("SELECT @@") || q_str.starts_with("select @@") {
                                 let w = QueryResultWriter::new(
                                     &mut self.writer,
                                     false,
                                     self.client_capabilities,
                                 );
-                                self.shim
-                                    .on_system_variable(
-                                        ::std::str::from_utf8(q).map_err(|e| {
-                                            io::Error::new(io::ErrorKind::InvalidData, e)
-                                        })?,
-                                        w,
-                                    )
-                                    .await?;
+                                self.shim.on_system_variable(q_str, w).await?;
                             } else if !self.process_use_statement_on_query
-                                && (q.starts_with(b"USE ") || q.starts_with(b"use "))
+                                && (q_str.starts_with("USE ") || q_str.starts_with("use "))
                             {
                                 let w = InitWriter {
                                     client_capabilities: self.client_capabilities,
                                     writer: &mut self.writer,
                                 };
-                                let schema = ::std::str::from_utf8(&q[b"USE ".len()..])
-                                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                                let schema = &q_str["USE ".len()..];
                                 let schema = schema.trim().trim_end_matches(';').trim_matches('`');
                                 self.shim.on_init(schema, w).await?;
                             } else {
@@ -831,102 +890,174 @@ where
                                     false,
                                     self.client_capabilities,
                                 );
-                                self.shim
-                                    .on_query(
-                                        ::std::str::from_utf8(q).map_err(|e| {
-                                            io::Error::new(io::ErrorKind::InvalidData, e)
-                                        })?,
-                                        w,
-                                    )
-                                    .await?;
+                                self.shim.on_query(q_str, w).await?;
                             }
                         }
                         Command::Prepare(q) => {
+                            let q_str = match ::std::str::from_utf8(q) {
+                                Ok(s) => s,
+                                Err(e) => {
+                                    writers::write_err(
+                                        ErrorKind::ER_MALFORMED_PACKET,
+                                        format!("prepare query is not valid utf-8: {}", e)
+                                            .as_bytes(),
+                                        &mut self.writer,
+                                    )
+                                    .await?;
+                                    self.writer.flush_all().await?;
+                                    continue;
+                                }
+                            };
                             let w = StatementMetaWriter {
                                 writer: &mut self.writer,
                                 stmts: &mut stmts,
                                 client_capabilities: self.client_capabilities,
                             };
 
-                            self.shim
-                                .on_prepare(
-                                    ::std::str::from_utf8(q).map_err(|e| {
-                                        io::Error::new(io::ErrorKind::InvalidData, e)
-                                    })?,
-                                    w,
-                                )
-                                .await?;
+                            self.shim.on_prepare(q_str, w).await?;
                         }
                         Command::Execute { stmt, params } => {
-                            let state = stmts.get_mut(&stmt).ok_or_else(|| {
-                                io::Error::new(
-                                    io::ErrorKind::InvalidData,
-                                    format!("asked to execute unknown statement {}", stmt),
-                                )
-                            })?;
-                            {
-                                let params = params::ParamParser::new(params, state)?;
+                            let state = match stmts.get_mut(&stmt) {
+                                Some(s) => s,
+                                None => {
+                                    writers::write_err(
+                                        ErrorKind::ER_UNKNOWN_STMT_HANDLER,
+                                        format!("unknown statement {}", stmt).as_bytes(),
+                                        &mut self.writer,
+                                    )
+                                    .await?;
+                                    self.writer.flush_all().await?;
+                                    continue;
+                                }
+                            };
+                            if let Some((kind, message)) = state.pending_error.as_ref() {
+                                writers::write_err(*kind, message.as_bytes(), &mut self.writer)
+                                    .await?;
+                            } else {
+                                let params = match params::ParamParser::new(params, state) {
+                                    Ok(p) => p,
+                                    Err(e) => {
+                                        state.long_data.clear();
+                                        writers::write_err(
+                                            ErrorKind::ER_MALFORMED_PACKET,
+                                            format!("malformed execute parameters: {}", e)
+                                                .as_bytes(),
+                                            &mut self.writer,
+                                        )
+                                        .await?;
+                                        self.writer.flush_all().await?;
+                                        continue;
+                                    }
+                                };
                                 let w = QueryResultWriter::new(
                                     &mut self.writer,
                                     true,
                                     self.client_capabilities,
                                 );
                                 self.shim.on_execute(stmt, params, w).await?;
+                                state.long_data.clear();
                             }
-                            state.long_data.clear();
                         }
                         Command::SendLongData { stmt, param, data } => {
-                            stmts
-                                .get_mut(&stmt)
-                                .ok_or_else(|| {
-                                    io::Error::new(
-                                        io::ErrorKind::InvalidData,
-                                        format!(
-                                            "got long data packet for unknown statement {}",
-                                            stmt
-                                        ),
-                                    )
-                                })?
-                                .long_data
-                                .entry(param)
-                                .or_insert_with(Vec::new)
-                                .extend(data);
+                            // COM_STMT_SEND_LONG_DATA never has a response. MySQL silently
+                            // ignores unknown statements and defers statement errors to EXECUTE.
+                            if let Some(state) = stmts.get_mut(&stmt) {
+                                if state.pending_error.is_none() {
+                                    if param >= state.params {
+                                        state.pending_error = Some((
+                                            ErrorKind::ER_WRONG_ARGUMENTS,
+                                            format!(
+                                                "got long data for parameter {} but statement {} has {} parameters",
+                                                param, stmt, state.params
+                                            ),
+                                        ));
+                                    } else {
+                                        let current_size = state
+                                            .long_data
+                                            .values()
+                                            .try_fold(0usize, |total, value| {
+                                                total.checked_add(value.len())
+                                            });
+                                        let new_size = current_size
+                                            .and_then(|size| size.checked_add(data.len()));
+                                        if let Some(new_size) = new_size {
+                                            if new_size <= self.max_long_data_size {
+                                                state
+                                                    .long_data
+                                                    .entry(param)
+                                                    .or_insert_with(Vec::new)
+                                                    .extend(data);
+                                            } else {
+                                                state.pending_error = Some((
+                                                    ErrorKind::ER_NET_PACKET_TOO_LARGE,
+                                                    format!(
+                                                        "long data exceeds configured limit: {} bytes > {} bytes",
+                                                        new_size, self.max_long_data_size
+                                                    ),
+                                                ));
+                                            }
+                                        } else {
+                                            state.pending_error = Some((
+                                                ErrorKind::ER_NET_PACKET_TOO_LARGE,
+                                                "long data size overflow".to_string(),
+                                            ));
+                                        }
+                                    }
+                                }
+                            }
                         }
                         Command::Close(stmt) => {
                             self.shim.on_close(stmt).await;
                             stmts.remove(&stmt);
                             // NOTE: spec dictates no response from server
                         }
+                        Command::Reset(stmt) => {
+                            if let Some(state) = stmts.get_mut(&stmt) {
+                                state.long_data.clear();
+                                state.pending_error = None;
+                                writers::write_ok_packet(
+                                    &mut self.writer,
+                                    self.client_capabilities,
+                                    OkResponse::default(),
+                                )
+                                .await?;
+                            } else {
+                                writers::write_err(
+                                    ErrorKind::ER_UNKNOWN_STMT_HANDLER,
+                                    format!("unknown statement {}", stmt).as_bytes(),
+                                    &mut self.writer,
+                                )
+                                .await?;
+                            }
+                        }
                         Command::ListFields(_) => {
                             // mysql_list_fields (CommandByte::COM_FIELD_LIST / 0x04) has been deprecated in mysql 5.7
                             // and will be removed in a future version.
                             // The mysql command line tool issues one of these commands after switching databases with USE <DB>.
-                            // Return a invalid column definitions lead to incorrect mariadb-client behaviour,
-                            // see https://github.com/datafuselabs/databend/issues/4439
-                            let ok_packet = OkResponse {
-                                header: 0xfe,
-                                ..Default::default()
-                            };
-                            writers::write_ok_packet(
-                                &mut self.writer,
-                                self.client_capabilities,
-                                ok_packet,
-                            )
-                            .await?;
+                            // An empty COM_FIELD_LIST response is closed by a real EOF
+                            // packet, even when the client negotiated CLIENT_DEPRECATE_EOF.
+                            writers::write_eof_packet(&mut self.writer, StatusFlags::empty())
+                                .await?;
                         }
                         Command::Init(schema) => {
+                            let schema_str = match ::std::str::from_utf8(schema) {
+                                Ok(s) => s,
+                                Err(e) => {
+                                    writers::write_err(
+                                        ErrorKind::ER_MALFORMED_PACKET,
+                                        format!("schema name is not valid utf-8: {}", e).as_bytes(),
+                                        &mut self.writer,
+                                    )
+                                    .await?;
+                                    self.writer.flush_all().await?;
+                                    continue;
+                                }
+                            };
                             let w = InitWriter {
                                 client_capabilities: self.client_capabilities,
                                 writer: &mut self.writer,
                             };
-                            self.shim
-                                .on_init(
-                                    ::std::str::from_utf8(schema).map_err(|e| {
-                                        io::Error::new(io::ErrorKind::InvalidData, e)
-                                    })?,
-                                    w,
-                                )
-                                .await?;
+                            self.shim.on_init(schema_str, w).await?;
                         }
                         Command::Ping => {
                             writers::write_ok_packet(

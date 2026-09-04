@@ -60,7 +60,13 @@ fn reuse_or_create_buf(old_buf: bytes::Bytes, last_buf_size: usize) -> BytesMut 
             unique
         }
         Err(remain) => {
-            let mut buf = BytesMut::with_capacity(new_buf_size);
+            let len = remain.len();
+            let resize_buf = if new_buf_size <= len {
+                len.checked_mul(2).unwrap_or(len)
+            } else {
+                new_buf_size
+            };
+            let mut buf = BytesMut::with_capacity(resize_buf);
             // if old buffer still contain bytes unread, need to save those bytes too
             buf.extend_from_slice(&remain);
             buf
@@ -69,6 +75,9 @@ fn reuse_or_create_buf(old_buf: bytes::Bytes, last_buf_size: usize) -> BytesMut 
 }
 
 fn read_into_bytesmut<R: Read>(reader: &mut R, buf: &mut BytesMut) -> io::Result<usize> {
+    if buf.spare_capacity_mut().is_empty() {
+        buf.reserve(PACKET_BUFFER_SIZE);
+    }
     let spare = buf.spare_capacity_mut();
     // Cap the read buffer to 64KB to avoid O(capacity) memset overhead
     // on large unused capacities, while maintaining good read throughput.
@@ -106,17 +115,47 @@ impl<R> PacketReader<R> {
         }
     }
 
-    fn ensure_packet_limit(&self, buffered: usize) -> io::Result<()> {
-        if buffered > self.max_packet_size {
-            Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "packet exceeds configured limit: buffered {} bytes > limit {} bytes",
-                    buffered, self.max_packet_size
-                ),
-            ))
-        } else {
-            Ok(())
+    fn ensure_packet_limit(&self) -> io::Result<()> {
+        let mut input = self.bytes.as_ref();
+        let mut payload_size = 0usize;
+
+        loop {
+            if input.len() < 3 {
+                return Ok(());
+            }
+
+            let frame_payload_size =
+                input[0] as usize | ((input[1] as usize) << 8) | ((input[2] as usize) << 16);
+            payload_size = payload_size
+                .checked_add(frame_payload_size)
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "packet exceeds configured limit: payload size overflow",
+                    )
+                })?;
+            if payload_size > self.max_packet_size {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "packet exceeds configured limit: payload {} bytes > limit {} bytes",
+                        payload_size, self.max_packet_size
+                    ),
+                ));
+            }
+
+            // The length field is known, so the limit above can reject early even
+            // when the payload has not arrived in full yet. Do not inspect a
+            // following frame until this frame is complete.
+            let frame_size = 4usize.saturating_add(frame_payload_size);
+            if input.len() < frame_size {
+                return Ok(());
+            }
+
+            if frame_payload_size < U24_MAX {
+                return Ok(());
+            }
+            input = &input[frame_size..];
         }
     }
 }
@@ -127,6 +166,7 @@ impl<R: Read> PacketReader<R> {
         loop {
             let last_buffer_size = self.bytes.len();
             if !self.bytes.is_empty() {
+                self.ensure_packet_limit()?;
                 // coping `bytes::Bytes` are very cheap, just move the pointer and increase the ref count.
                 match packet(self.bytes.clone().into()) {
                     Ok((rest, p)) => {
@@ -149,7 +189,6 @@ impl<R: Read> PacketReader<R> {
             let mut buf = reuse_or_create_buf(std::mem::take(&mut self.bytes), last_buffer_size);
             let read_cnt = read_into_bytesmut(&mut self.r, &mut buf)?;
             self.bytes = buf.freeze();
-            self.ensure_packet_limit(self.bytes.len())?;
 
             // for a [TcpStream], returning zero indicates the connection was shut down correctly.
             if read_cnt == 0 {
@@ -189,6 +228,7 @@ impl<R: AsyncRead + Unpin> PacketReader<R> {
         loop {
             let last_buffer_size = self.bytes.len();
             if !self.bytes.is_empty() {
+                self.ensure_packet_limit()?;
                 match packet(self.bytes.clone().into()) {
                     Ok((rest, p)) => {
                         self.bytes = rest.into();
@@ -208,7 +248,6 @@ impl<R: AsyncRead + Unpin> PacketReader<R> {
             let mut buf = reuse_or_create_buf(std::mem::take(&mut self.bytes), last_buffer_size);
             let read_cnt = self.r.read_buf(&mut buf).await?;
             self.bytes = buf.freeze();
-            self.ensure_packet_limit(self.bytes.len())?;
 
             if read_cnt == 0 {
                 if self.bytes.is_empty() {
@@ -344,15 +383,21 @@ impl nom::Slice<RangeFrom<usize>> for NomBytes {
 #[derive(Clone)]
 pub struct Packet<'a> {
     bytes: bytes::Bytes,
+    first_seq: u8,
     _lifetime: PhantomData<&'a ()>, // NOTE: the lifetime can be removed since Bytes mangaes the lifetime by itself
 }
 
 impl Packet<'_> {
-    fn from_bytes(bytes: bytes::Bytes) -> Self {
+    fn from_bytes(bytes: bytes::Bytes, first_seq: u8) -> Self {
         Packet {
             bytes,
+            first_seq,
             _lifetime: PhantomData,
         }
+    }
+
+    pub(crate) fn first_sequence_id(&self) -> u8 {
+        self.first_seq
     }
 }
 
@@ -366,7 +411,9 @@ impl Deref for Packet<'_> {
     }
 }
 
-// note that for small packet, this function is zero-copy, but for packet >= 2^24 it currently copy stuff, this await further optimization
+// Note: For small packets (< 2^24), this function is zero-copy.
+// For multi-frame packets (>= 2^24), frames are probed first to ensure complete arrival
+// before allocating and assembling into a single contiguous buffer.
 pub(crate) fn packet<'a>(i: NomBytes) -> nom::IResult<NomBytes, (u8, Packet<'a>)> {
     fn sequence_mismatch(input: &NomBytes) -> nom::Err<nom::error::Error<NomBytes>> {
         nom::Err::Failure(nom::error::Error::new(
@@ -375,76 +422,92 @@ pub(crate) fn packet<'a>(i: NomBytes) -> nom::IResult<NomBytes, (u8, Packet<'a>)
         ))
     }
 
-    nom::combinator::map(
-        nom::sequence::pair(
-            nom::multi::fold_many0(
-                fullpacket,
-                || {
-                    (
-                        0u8,
-                        None::<BytesMut>,
-                        None::<nom::Err<nom::error::Error<NomBytes>>>,
-                    )
-                },
-                |(seq, pkt, err): (
-                    u8,
-                    Option<BytesMut>,
-                    Option<nom::Err<nom::error::Error<NomBytes>>>,
-                ),
-                 (nseq, p)| {
-                    if err.is_some() {
-                        return (seq, pkt, err);
-                    }
+    let header = i
+        .as_ref()
+        .get(..3)
+        .ok_or(nom::Err::Incomplete(Needed::Unknown))?;
+    let payload_len =
+        header[0] as usize | ((header[1] as usize) << 8) | ((header[2] as usize) << 16);
 
-                    let pkt = if let Some(mut pkt) = pkt {
-                        if nseq != seq.wrapping_add(1) {
-                            return (seq, Some(pkt), Some(sequence_mismatch(&p)));
-                        }
-                        pkt.extend_from_slice(p.as_ref());
-                        Some(pkt)
-                    } else {
-                        // TODO: avoid copy
-                        Some(BytesMut::from(p.0))
-                    };
-                    (nseq, pkt, None)
-                },
-            ),
-            nom::combinator::opt(onepacket),
-        ),
-        move |((full_seq, full_pkt, err), last): (
-            (
-                u8,
-                Option<BytesMut>,
-                Option<nom::Err<nom::error::Error<NomBytes>>>,
-            ),
-            Option<(u8, NomBytes)>,
-        )| {
-            if let Some(err) = err {
-                return Err(err);
-            }
+    if payload_len < U24_MAX {
+        let (rest, (seq, payload)) = onepacket(i)?;
+        return Ok((rest, (seq, Packet::from_bytes(payload.0, seq))));
+    }
 
-            match (full_pkt, last) {
-                (Some(mut full_pkt), Some((last_seq, last_pkt))) => {
-                    if last_seq != full_seq.wrapping_add(1) {
-                        return Err(sequence_mismatch(&last_pkt));
-                    }
-                    full_pkt.extend_from_slice(last_pkt.as_ref());
-                    let final_pkt = full_pkt.freeze();
-                    Ok((last_seq, Packet::from_bytes(final_pkt)))
-                }
-                (Some(full_pkt), None) => Ok((full_seq, Packet::from_bytes(full_pkt.freeze()))),
-                (None, Some((last_seq, last_pkt))) => {
-                    Ok((last_seq, Packet::from_bytes(last_pkt.0)))
-                }
-                // TODO: might know length
-                (None, None) => Err(nom::Err::Incomplete(Needed::Unknown)),
+    // Multi-frame packet: probe all frames first to ensure the full packet has arrived
+    // before allocating and assembling. This prevents O(N^2) allocations/copies while
+    // frames are arriving in streaming chunks.
+    let mut probe_input = i.as_ref();
+    let mut total_payload_size = 0usize;
+    let mut probe_prev_seq: Option<u8> = None;
+
+    loop {
+        if probe_input.len() < 4 {
+            return Err(nom::Err::Incomplete(Needed::Unknown));
+        }
+        let frame_len = probe_input[0] as usize
+            | ((probe_input[1] as usize) << 8)
+            | ((probe_input[2] as usize) << 16);
+        let frame_seq = probe_input[3];
+
+        if let Some(prev) = probe_prev_seq {
+            if frame_seq != prev.wrapping_add(1) {
+                return Err(sequence_mismatch(&NomBytes::from(&probe_input[4..])));
             }
-        },
-    )(i)
-    .map(|(rest, parsed)| match parsed {
-        Ok(parsed) => Ok((rest, parsed)),
-        Err(e) => Err(e),
-    })?
+        }
+        probe_prev_seq = Some(frame_seq);
+
+        let frame_total = 4usize.saturating_add(frame_len);
+        if probe_input.len() < frame_total {
+            return Err(nom::Err::Incomplete(Needed::Unknown));
+        }
+
+        total_payload_size = total_payload_size
+            .checked_add(frame_len)
+            .ok_or_else(|| sequence_mismatch(&NomBytes::from(&probe_input[4..])))?;
+
+        probe_input = &probe_input[frame_total..];
+
+        if frame_len < U24_MAX {
+            break;
+        }
+    }
+
+    // All frames are present in memory. Assemble in a single pre-allocated BytesMut.
+    let mut input = i;
+    let mut assembled = BytesMut::with_capacity(total_payload_size);
+    let mut previous_seq = None::<u8>;
+    let mut first_seq = None::<u8>;
+
+    loop {
+        let header = input
+            .as_ref()
+            .get(..3)
+            .ok_or(nom::Err::Incomplete(Needed::Unknown))?;
+        let payload_len =
+            header[0] as usize | ((header[1] as usize) << 8) | ((header[2] as usize) << 16);
+
+        let (rest, (seq, payload)) = if payload_len == U24_MAX {
+            fullpacket(input)?
+        } else {
+            onepacket(input)?
+        };
+        let first = *first_seq.get_or_insert(seq);
+
+        if let Some(prev) = previous_seq {
+            if seq != prev.wrapping_add(1) {
+                return Err(sequence_mismatch(&payload));
+            }
+        }
+        previous_seq = Some(seq);
+
+        assembled.extend_from_slice(payload.as_ref());
+        input = rest;
+
+        if payload_len < U24_MAX {
+            return Ok((input, (seq, Packet::from_bytes(assembled.freeze(), first))));
+        }
+    }
 }
 
 #[cfg(test)]
@@ -457,21 +520,59 @@ mod test {
     fn mock_packet(mut data: bytes::Bytes, start_seq: u8) -> bytes::Bytes {
         let mut buf = BytesMut::new();
         let mut seq = start_seq;
-        while data.len() > U24_MAX {
+        let mut sent_full_packet = false;
+        while data.len() >= U24_MAX {
             buf.extend_from_slice(&[0xff, 0xff, 0xff]);
             buf.put_u8(seq);
             buf.put(&data[0..U24_MAX]);
             data.advance(U24_MAX);
             seq += 1;
+            sent_full_packet = true;
         }
-        if !data.is_empty() {
+        if !data.is_empty() || sent_full_packet {
             let le_u64: [u8; 8] = data.len().to_le_bytes();
             let le_u24 = &le_u64[0..3];
             buf.extend_from_slice(le_u24);
             buf.put_u8(seq);
-            buf.put(data);
+            if !data.is_empty() {
+                buf.put(data);
+            }
         }
         buf.freeze()
+    }
+
+    #[tokio::test]
+    async fn next_async_waits_for_terminator_after_full_packet() {
+        use tokio::io::AsyncWriteExt;
+        use tokio::sync::oneshot;
+        use tokio::time::{timeout, Duration};
+
+        let (mut client, server) = tokio::io::duplex(U24_MAX + 16);
+        let (first_written_tx, first_written_rx) = oneshot::channel();
+        let (send_terminator_tx, send_terminator_rx) = oneshot::channel();
+
+        let writer = tokio::spawn(async move {
+            client.write_all(&[0xff, 0xff, 0xff, 0]).await.unwrap();
+            client.write_all(&vec![0; U24_MAX]).await.unwrap();
+            first_written_tx.send(()).unwrap();
+            send_terminator_rx.await.unwrap();
+            client.write_all(&[0x00, 0x00, 0x00, 1]).await.unwrap();
+        });
+
+        first_written_rx.await.unwrap();
+        let mut reader = PacketReader::new(server);
+        let mut next = Box::pin(reader.next_async());
+
+        assert!(
+            timeout(Duration::from_millis(25), &mut next).await.is_err(),
+            "a full-size fragment is not a complete logical packet"
+        );
+
+        send_terminator_tx.send(()).unwrap();
+        let (seq, packet) = next.await.unwrap().unwrap();
+        assert_eq!(seq, 1);
+        assert_eq!(packet.len(), U24_MAX);
+        writer.await.unwrap();
     }
 
     #[tokio::test]
@@ -542,7 +643,7 @@ mod test {
 
     #[test]
     fn next_rejects_packets_above_limit() {
-        let payload = bytes::Bytes::from(vec![1u8; 32]);
+        let payload = bytes::Bytes::from(vec![1u8; 17]);
         let packet = mock_packet(payload, 0);
         let mut reader = PacketReader::new_with_max_packet_size(packet.reader(), 16);
 
@@ -555,5 +656,83 @@ mod test {
         };
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         assert!(err.to_string().contains("packet exceeds configured limit"));
+    }
+
+    #[test]
+    fn next_rejects_declared_payload_before_frame_body_arrives() {
+        let mut reader = PacketReader::new_with_max_packet_size([17, 0, 0].reader(), 16);
+
+        let err = match reader.next() {
+            Ok(_) => panic!("declared payload above the limit must fail before its body arrives"),
+            Err(err) => err,
+        };
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn next_allows_payload_exactly_at_limit() {
+        let payload = bytes::Bytes::from(vec![1u8; 16]);
+        let packet = mock_packet(payload, 0);
+        let mut reader = PacketReader::new_with_max_packet_size(packet.reader(), 16);
+
+        let (_, parsed) = reader.next().unwrap().unwrap();
+        assert_eq!(parsed.len(), 16);
+    }
+
+    #[test]
+    fn next_ignores_read_ahead_when_enforcing_limit() {
+        let mut wire = BytesMut::new();
+        wire.extend_from_slice(&[4, 0, 0, 0]);
+        wire.extend_from_slice(b"ping");
+        wire.extend_from_slice(&[4, 0, 0, 0]);
+        wire.extend_from_slice(b"pong");
+        let mut reader = PacketReader::new_with_max_packet_size(wire.freeze().reader(), 4);
+
+        let (_, first) = reader.next().unwrap().unwrap();
+        assert_eq!(&*first, b"ping");
+        let (_, second) = reader.next().unwrap().unwrap();
+        assert_eq!(&*second, b"pong");
+    }
+
+    #[test]
+    fn next_rejects_multi_frame_payload_above_limit() {
+        let payload = bytes::Bytes::from(vec![1u8; U24_MAX + 1]);
+        let packet = mock_packet(payload, 0);
+        let mut reader = PacketReader::new_with_max_packet_size(packet.reader(), U24_MAX);
+
+        let err = match reader.next() {
+            Ok(_) => panic!("multi-frame payload above the limit must fail"),
+            Err(err) => err,
+        };
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("packet exceeds configured limit"));
+    }
+
+    #[test]
+    fn reuse_or_create_buf_guarantees_spare_capacity_on_large_shared_buffer() {
+        let large_size = 2 * 1024 * 1024; // 2 MB > PACKET_LARGE_BUFFER_SIZE (1 MB)
+        let original = bytes::Bytes::from(vec![0x42u8; large_size]);
+        let shared = original.clone(); // ensure refcount > 1, forcing Err(remain)
+
+        let buf = reuse_or_create_buf(shared, large_size);
+        assert!(
+            buf.capacity() > buf.len(),
+            "allocated buffer must have spare capacity to receive more data: cap={}, len={}",
+            buf.capacity(),
+            buf.len()
+        );
+        assert_eq!(buf.len(), large_size);
+    }
+
+    #[test]
+    fn read_into_bytesmut_reserves_when_spare_capacity_is_zero() {
+        let mut buf = BytesMut::with_capacity(10);
+        buf.extend_from_slice(b"0123456789");
+        assert_eq!(buf.capacity(), buf.len());
+
+        let mut data = &b"hello"[..];
+        let n = read_into_bytesmut(&mut data, &mut buf).unwrap();
+        assert_eq!(n, 5);
+        assert_eq!(&buf[10..], b"hello");
     }
 }

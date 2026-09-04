@@ -78,7 +78,9 @@ pub fn client_handshake(i: &[u8], after_tls: bool) -> nom::IResult<&[u8], Client
                 let (i, size) = nom::number::complete::le_u8(i)?;
                 nom::bytes::complete::take(size)(i)?
             } else {
-                nom::bytes::complete::take_until(&b"\0"[..])(i)?
+                let (i, auth_response) = nom::bytes::complete::take_until(&b"\0"[..])(i)?;
+                let (i, _) = nom::bytes::complete::tag(b"\0")(i)?;
+                (i, auth_response)
             };
 
         let (i, db) =
@@ -122,10 +124,10 @@ pub fn client_handshake(i: &[u8], after_tls: bool) -> nom::IResult<&[u8], Client
 
         let (i, auth_response, db) =
             if capabilities.contains(CapabilityFlags::CLIENT_CONNECT_WITH_DB) {
-                let (i, auth_response) = nom::bytes::complete::tag(b"\0")(i)?;
+                let (i, auth_response) = nom::bytes::complete::take_until(&b"\0"[..])(i)?;
                 let (i, _) = nom::bytes::complete::tag(b"\0")(i)?;
 
-                let (i, db) = nom::bytes::complete::tag(b"\0")(i)?;
+                let (i, db) = nom::bytes::complete::take_until(&b"\0"[..])(i)?;
                 let (i, _) = nom::bytes::complete::tag(b"\0")(i)?;
 
                 (i, auth_response, Some(db))
@@ -168,6 +170,7 @@ pub enum Command<'a> {
     Query(&'a [u8]),
     ListFields(&'a [u8]),
     Close(u32),
+    Reset(u32),
     Prepare(&'a [u8]),
     Init(&'a [u8]),
     Execute {
@@ -235,6 +238,13 @@ pub fn parse(i: &[u8]) -> nom::IResult<&[u8], Command<'_>> {
                 nom::number::complete::le_u32,
             ),
             Command::Close,
+        ),
+        map(
+            preceded(
+                tag(&[CommandByte::COM_STMT_RESET as u8]),
+                nom::number::complete::le_u32,
+            ),
+            Command::Reset,
         ),
         map(tag(&[CommandByte::COM_QUIT as u8]), |_| Command::Quit),
         map(tag(&[CommandByte::COM_PING as u8]), |_| Command::Ping),

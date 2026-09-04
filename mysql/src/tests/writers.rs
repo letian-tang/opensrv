@@ -125,7 +125,7 @@ async fn ok_packet_info_lenenc_when_session_track() {
 }
 
 #[tokio::test]
-async fn ok_packet_info_lenenc_when_deprecate_eof() {
+async fn ok_packet_info_is_plain_when_deprecate_eof_without_session_track() {
     let info = "Read 1 rows, 1.00 B in 0.007 sec.";
     let payload = capture_ok_payload(
         info,
@@ -134,35 +134,25 @@ async fn ok_packet_info_lenenc_when_deprecate_eof() {
     )
     .await;
 
-    let (mut idx, header, status, warnings) = consume_ok_prefix(&payload);
+    let (idx, header, status, warnings) = consume_ok_prefix(&payload);
     assert_eq!(header, 0x00);
     assert_eq!(status, 0);
     assert_eq!(warnings, 0);
 
-    let (info_len, consumed) = parse_lenenc_int(&payload[idx..]);
-    assert_eq!(info_len as usize, info.len());
-    idx += consumed;
-
-    let encoded = &payload[idx..idx + info.len()];
-    assert_eq!(encoded, info.as_bytes());
+    assert_eq!(&payload[idx..], info.as_bytes());
 }
 
 #[tokio::test]
-async fn ok_packet_info_lenenc_when_header_fe() {
+async fn ok_packet_info_is_plain_when_header_is_fe_without_session_track() {
     let info = "Read 1 rows, 1.00 B in 0.007 sec.";
     let payload = capture_ok_payload(info, CapabilityFlags::CLIENT_PROTOCOL_41, 0xfe).await;
 
-    let (mut idx, header, status, warnings) = consume_ok_prefix(&payload);
+    let (idx, header, status, warnings) = consume_ok_prefix(&payload);
     assert_eq!(header, 0xfe);
     assert_eq!(status, 0);
     assert_eq!(warnings, 0);
 
-    let (info_len, consumed) = parse_lenenc_int(&payload[idx..]);
-    assert_eq!(info_len as usize, info.len());
-    idx += consumed;
-
-    let encoded = &payload[idx..idx + info.len()];
-    assert_eq!(encoded, info.as_bytes());
+    assert_eq!(&payload[idx..], info.as_bytes());
 }
 
 #[tokio::test]

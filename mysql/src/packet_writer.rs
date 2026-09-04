@@ -102,7 +102,7 @@ impl<W: AsyncWrite + Unpin> PacketWriter<W> {
     pub async fn end_packet(&mut self) -> io::Result<()> {
         if !self.packet_builder.is_empty() {
             let raw_packet = self.packet_builder.take_buffer();
-            let needs_empty_packet = raw_packet.len() % U24_MAX == 0;
+            let needs_empty_packet = raw_packet.len().is_multiple_of(U24_MAX);
             let should_flush = self.flush_threshold > 0 && raw_packet.len() >= self.flush_threshold;
 
             // split the raw buffer at the boundary of size U24_MAX

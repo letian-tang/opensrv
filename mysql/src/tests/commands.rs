@@ -72,6 +72,28 @@ fn it_parses_handshake_with_caching_sha2_password() {
 }
 
 #[test]
+fn it_parses_nul_terminated_auth_response_before_database_and_plugin() {
+    let capabilities = CapabilityFlags::CLIENT_PROTOCOL_41
+        | CapabilityFlags::CLIENT_CONNECT_WITH_DB
+        | CapabilityFlags::CLIENT_PLUGIN_AUTH;
+    let mut payload = Vec::new();
+    payload.extend_from_slice(&capabilities.bits().to_le_bytes());
+    payload.extend_from_slice(&0u32.to_le_bytes());
+    payload.push(UTF8_GENERAL_CI as u8);
+    payload.extend_from_slice(&[0; 23]);
+    payload.extend_from_slice(b"user\0");
+    payload.extend_from_slice(b"legacy-auth\0");
+    payload.extend_from_slice(b"initial_db\0");
+    payload.extend_from_slice(b"mysql_native_password\0");
+
+    let (rest, handshake) = client_handshake(&payload, false).unwrap();
+    assert!(rest.is_empty());
+    assert_eq!(handshake.auth_response, b"legacy-auth");
+    assert_eq!(handshake.db, Some(b"initial_db".to_vec()));
+    assert_eq!(handshake.auth_plugin, b"mysql_native_password");
+}
+
+#[test]
 fn it_parses_request() {
     let data = &[
         0x21, 0x00, 0x00, 0x00, 0x03, 0x73, 0x65, 0x6c, 0x65, 0x63, 0x74, 0x20, 0x40, 0x40, 0x76,
@@ -106,4 +128,36 @@ fn it_handles_list_fields() {
         cmd,
         Command::ListFields(&b"select @@version_comment limit 1"[..])
     );
+}
+
+#[test]
+fn it_parses_handshake_response320() {
+    // 320 with database
+    let mut payload = Vec::new();
+    let cap = (CapabilityFlags::CLIENT_CONNECT_WITH_DB.bits() & 0xffff) as u16;
+    payload.extend_from_slice(&cap.to_le_bytes());
+    payload.extend_from_slice(&[0x00, 0x01, 0x00]); // maxps = 24-bit le (65536)
+    payload.extend_from_slice(b"alice\0");
+    payload.extend_from_slice(b"mypass\0");
+    payload.extend_from_slice(b"mydb\0");
+
+    let (rest, handshake) = client_handshake(&payload, false).unwrap();
+    assert!(rest.is_empty());
+    assert_eq!(handshake.username, Some(b"alice".to_vec()));
+    assert_eq!(handshake.auth_response, b"mypass");
+    assert_eq!(handshake.db, Some(b"mydb".to_vec()));
+
+    // 320 without database (auth response is string<EOF>)
+    let mut payload = Vec::new();
+    let cap = 0u16;
+    payload.extend_from_slice(&cap.to_le_bytes());
+    payload.extend_from_slice(&[0x00, 0x01, 0x00]);
+    payload.extend_from_slice(b"bob\0");
+    payload.extend_from_slice(b"secret_bytes");
+
+    let (rest, handshake) = client_handshake(&payload, false).unwrap();
+    assert!(rest.is_empty());
+    assert_eq!(handshake.username, Some(b"bob".to_vec()));
+    assert_eq!(handshake.auth_response, b"secret_bytes");
+    assert_eq!(handshake.db, None);
 }

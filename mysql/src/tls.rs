@@ -50,12 +50,16 @@ where
 
     let process_use_statement_on_query = opts.process_use_statement_on_query;
     let reject_connection_on_dbname_absence = opts.reject_connection_on_dbname_absence;
+    let max_long_data_size = opts
+        .max_packet_size
+        .unwrap_or(crate::packet_reader::DEFAULT_MAX_PACKET_SIZE);
     let mut mi = AsyncMysqlIntermediary {
         client_capabilities,
         process_use_statement_on_query,
         reject_connection_on_dbname_absence,
         read_timeout: opts.read_timeout,
         auth_timeout: opts.auth_timeout,
+        max_long_data_size,
         shim,
         reader,
         writer,
@@ -88,12 +92,16 @@ where
 
     let process_use_statement_on_query = opts.process_use_statement_on_query;
     let reject_connection_on_dbname_absence = opts.reject_connection_on_dbname_absence;
+    let max_long_data_size = opts
+        .max_packet_size
+        .unwrap_or(crate::packet_reader::DEFAULT_MAX_PACKET_SIZE);
     let mut mi = AsyncMysqlIntermediary {
         client_capabilities,
         process_use_statement_on_query,
         reject_connection_on_dbname_absence,
         read_timeout: opts.read_timeout,
         auth_timeout: opts.auth_timeout,
+        max_long_data_size,
         shim,
         reader,
         writer,
