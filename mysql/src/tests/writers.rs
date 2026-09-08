@@ -30,6 +30,117 @@ use crate::packet_writer::PacketWriter;
 use crate::writers::write_ok_packet;
 use crate::{CapabilityFlags, OkResponse, U24_MAX};
 
+fn split_wire_packets(mut wire: &[u8]) -> Vec<Vec<u8>> {
+    let mut packets = Vec::new();
+    while !wire.is_empty() {
+        assert!(wire.len() >= 4);
+        let len = wire[0] as usize | (wire[1] as usize) << 8 | (wire[2] as usize) << 16;
+        assert_eq!(wire[3], packets.len() as u8);
+        assert!(wire.len() >= 4 + len);
+        packets.push(wire[4..4 + len].to_vec());
+        wire = &wire[4 + len..];
+    }
+    packets
+}
+
+#[tokio::test]
+async fn ok_session_state_requires_both_capability_and_status() {
+    for session_track in [false, true] {
+        for deprecate_eof in [false, true] {
+            for changed in [false, true] {
+                let mut caps = CapabilityFlags::CLIENT_PROTOCOL_41;
+                caps.set(CapabilityFlags::CLIENT_SESSION_TRACK, session_track);
+                caps.set(CapabilityFlags::CLIENT_DEPRECATE_EOF, deprecate_eof);
+                let mut status = crate::StatusFlags::empty();
+                status.set(crate::StatusFlags::SERVER_SESSION_STATE_CHANGED, changed);
+                let mut wire = Vec::new();
+                let mut writer = PacketWriter::new(&mut wire);
+                // A session-state-change record: type 2, data length 2, string "1".
+                write_ok_packet(
+                    &mut writer,
+                    caps,
+                    OkResponse {
+                        header: if deprecate_eof { 0xfe } else { 0 },
+                        status_flags: status,
+                        info: "info".into(),
+                        session_state_info: "\x02\x02\x011".into(),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+                let mut expected = vec![if deprecate_eof { 0xfe } else { 0 }, 0, 0];
+                expected.extend_from_slice(&status.bits().to_le_bytes());
+                expected.extend_from_slice(&[0, 0]);
+                if session_track {
+                    expected.push(4);
+                }
+                expected.extend_from_slice(b"info");
+                if session_track && changed {
+                    expected.extend_from_slice(&[4, 2, 2, 1, b'1']);
+                }
+                drop(writer);
+                assert_eq!(split_wire_packets(&wire), vec![expected]);
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn resultset_terminators_follow_capability_matrix() {
+    for session_track in [false, true] {
+        for deprecate_eof in [false, true] {
+            for binary in [false, true] {
+                let mut caps = CapabilityFlags::CLIENT_PROTOCOL_41;
+                caps.set(CapabilityFlags::CLIENT_SESSION_TRACK, session_track);
+                caps.set(CapabilityFlags::CLIENT_DEPRECATE_EOF, deprecate_eof);
+                let columns = [crate::Column {
+                    table: String::new(),
+                    column: "n".into(),
+                    collen: 4,
+                    coltype: crate::ColumnType::MYSQL_TYPE_LONG,
+                    colflags: crate::ColumnFlags::empty(),
+                }];
+                let mut wire = Vec::new();
+                let mut writer = PacketWriter::new(&mut wire);
+                let mut rows = crate::QueryResultWriter::new(&mut writer, binary, caps)
+                    .start(&columns)
+                    .await
+                    .unwrap();
+                rows.write_row([42i32]).await.unwrap();
+                rows.finish().await.unwrap();
+                drop(writer);
+                let packets = split_wire_packets(&wire);
+                assert_eq!(packets.len(), if deprecate_eof { 4 } else { 5 });
+                assert_eq!(packets[0], [1]);
+                let row_index = if deprecate_eof {
+                    2
+                } else {
+                    assert_eq!(packets[2], [0xfe, 0, 0, 0, 0]);
+                    3
+                };
+                assert_eq!(
+                    packets[row_index],
+                    if binary {
+                        vec![0, 0, 42, 0, 0, 0]
+                    } else {
+                        vec![2, b'4', b'2']
+                    }
+                );
+                let mut end = if deprecate_eof {
+                    vec![0xfe, 0, 0, 0, 0, 0, 0]
+                } else {
+                    vec![0xfe, 0, 0, 0, 0]
+                };
+                if deprecate_eof && session_track {
+                    end.push(0);
+                }
+                assert_eq!(packets[row_index + 1], end);
+            }
+        }
+    }
+}
+
 async fn capture_ok_payload(info: &str, capabilities: CapabilityFlags, header: u8) -> Vec<u8> {
     let (mut client, server) = duplex(1024);
     let mut writer = PacketWriter::new(server);

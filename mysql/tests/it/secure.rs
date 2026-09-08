@@ -86,6 +86,136 @@ mod tls {
         Ok(config)
     }
 
+    // Feed already-decrypted MySQL bytes to exercise the post-TLS protocol stage.
+    #[tokio::test]
+    async fn post_tls_handshake_checks_sequence() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for seq in [0, 1, 2, 255] {
+            let (mut client, stream) = tokio::io::duplex(4096);
+            let config = Arc::new(setup_tls().unwrap());
+            let task = tokio::spawn(async move {
+                let (reader, mut writer) = tokio::io::split(stream);
+                let mut backend = Backend;
+                let opts = IntermediaryOptions::default();
+                let (ssl, init) = AsyncMysqlIntermediary::init_before_ssl_with_options(
+                    &mut backend,
+                    reader,
+                    &mut writer,
+                    &opts,
+                    &Some(config),
+                )
+                .await?;
+                assert!(ssl);
+                plain_run_with_options(backend, writer, opts, init).await
+            });
+            let mut header = [0; 4];
+            client.read_exact(&mut header).await.unwrap();
+            let size = u32::from_le_bytes([header[0], header[1], header[2], 0]) as usize;
+            let mut greeting = vec![0; size];
+            client.read_exact(&mut greeting).await.unwrap();
+            let mut response = vec![0; 32];
+            response[..4].copy_from_slice(&0x00088a00u32.to_le_bytes());
+            response[8] = 33;
+            client.write_all(&[32, 0, 0, 1]).await.unwrap();
+            client.write_all(&response).await.unwrap();
+            response.extend_from_slice(b"user\0\0");
+            response.extend_from_slice(b"mysql_native_password\0");
+            client
+                .write_all(&[response.len() as u8, 0, 0, seq])
+                .await
+                .unwrap();
+            client.write_all(&response).await.unwrap();
+            if seq == 2 {
+                client.read_exact(&mut header).await.unwrap();
+                assert_eq!(header[3], 3);
+                let mut ok = vec![0; header[0] as usize];
+                client.read_exact(&mut ok).await.unwrap();
+                assert_eq!(ok[0], 0);
+                client.write_all(&[1, 0, 0, 0, 1]).await.unwrap();
+            }
+            let result = tokio::time::timeout(std::time::Duration::from_secs(2), task)
+                .await
+                .unwrap()
+                .unwrap();
+            if seq == 2 {
+                result.unwrap();
+            } else {
+                assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidData);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn tls_upgrade_rejects_invalid_records_and_disconnects() {
+        for invalid_record in [false, true] {
+            let (mut client, task) = start_tls_upgrade().await;
+            use tokio::io::AsyncWriteExt;
+            if invalid_record {
+                client.write_all(b"GET / HTTP/1.0\r\n\r\n").await.unwrap();
+            }
+            client.shutdown().await.unwrap();
+            let result = tokio::time::timeout(std::time::Duration::from_secs(2), task)
+                .await
+                .expect("TLS failure must terminate task")
+                .unwrap();
+            assert!(result.is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn tls_upgrade_enforces_authentication_timeout() {
+        let (_client, mut task) = start_tls_upgrade().await;
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), &mut task).await;
+        if result.is_err() {
+            task.abort();
+        }
+        let error = result
+            .expect("auth_timeout must bound TLS negotiation")
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+    }
+
+    async fn start_tls_upgrade() -> (
+        tokio::io::DuplexStream,
+        tokio::task::JoinHandle<io::Result<()>>,
+    ) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let config = Arc::new(setup_tls().unwrap());
+        let (mut client, stream) = tokio::io::duplex(4096);
+        let task = tokio::spawn(async move {
+            let (mut reader, mut writer) = tokio::io::split(stream);
+            let mut backend = Backend;
+            let opts = IntermediaryOptions {
+                auth_timeout: Some(std::time::Duration::from_millis(100)),
+                ..Default::default()
+            };
+            let (is_ssl, init) = AsyncMysqlIntermediary::init_before_ssl_with_options(
+                &mut backend,
+                &mut reader,
+                &mut writer,
+                &opts,
+                &Some(config.clone()),
+            )
+            .await?;
+            assert!(is_ssl);
+            secure_run_with_options(backend, writer, opts, config, init).await
+        });
+        let mut header = [0; 4];
+        client.read_exact(&mut header).await.unwrap();
+        let len = header[0] as usize | (header[1] as usize) << 8 | (header[2] as usize) << 16;
+        let mut greeting = vec![0; len];
+        client.read_exact(&mut greeting).await.unwrap();
+        let mut request = vec![32, 0, 0, 1];
+        // CLIENT_PROTOCOL_41 | CLIENT_SSL
+        request.extend_from_slice(&0x00000a00u32.to_le_bytes());
+        request.extend_from_slice(&0u32.to_le_bytes());
+        request.push(33);
+        request.extend_from_slice(&[0; 23]);
+        client.write_all(&request).await.unwrap();
+        (client, task)
+    }
+
     pub async fn serve_on(listener: TcpListener) -> Result<(), Box<dyn std::error::Error>> {
         loop {
             let (stream, _) = listener.accept().await?;

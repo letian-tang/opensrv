@@ -159,6 +159,7 @@ pub fn verify_mysql_native_password(password: &[u8], salt: &[u8], auth_data: &[u
 }
 
 pub fn verify_caching_sha2_password(password: &[u8], salt: &[u8], auth_data: &[u8]) -> bool {
+    let auth_data = if auth_data == [0] { &[][..] } else { auth_data };
     match scramble_sha256(salt, password) {
         Some(expected) => auth_data == expected,
         None => auth_data.is_empty(),
@@ -585,7 +586,14 @@ where
                 )
             })?;
 
-        let handshake = commands::client_handshake(&handshake, false)
+        if handshake.first_sequence_id() != 1 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "unexpected initial handshake sequence",
+            )
+            .into());
+        }
+        let mut handshake = commands::client_handshake(&handshake, false)
             .map_err(|e| match e {
                 nom::Err::Incomplete(_) => io::Error::new(
                     io::ErrorKind::UnexpectedEof,
@@ -613,6 +621,7 @@ where
             })?
             .1;
 
+        handshake.server_scramble = Some(config.scramble);
         writer.set_seq(seq.wrapping_add(1));
 
         #[cfg(not(feature = "tls"))]
@@ -638,6 +647,12 @@ where
         #[cfg(not(feature = "tls"))] handshake: ClientHandshake,
         mut seq: u8,
     ) -> Result<(), B::Error> {
+        let scramble = handshake.server_scramble.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "missing server handshake challenge",
+            )
+        })?;
         #[cfg(feature = "tls")]
         if handshake.capabilities.contains(CapabilityFlags::CLIENT_SSL) {
             let (_seq, hs) = read_packet_with_timeout(&mut self.reader, self.auth_timeout)
@@ -648,6 +663,13 @@ where
                         "peer terminated connection",
                     )
                 })?;
+            if hs.first_sequence_id() != seq.wrapping_add(1) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "unexpected TLS handshake sequence",
+                )
+                .into());
+            }
             seq = _seq;
 
             handshake = commands::client_handshake(&hs, true)
@@ -681,7 +703,6 @@ where
             self.writer.set_seq(seq.wrapping_add(1));
         }
 
-        let scramble = self.shim.salt();
         {
             if !handshake
                 .capabilities
@@ -724,12 +745,23 @@ where
                                     )
                                 })?;
 
+                        if auth_response_data.first_sequence_id() != seq.wrapping_add(2) {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "unexpected auth-switch sequence",
+                            )
+                            .into());
+                        }
                         seq = rseq;
                         auth_response = auth_response_data.to_vec();
                     }
                 }
 
                 self.writer.set_seq(seq.wrapping_add(1));
+
+                if auth_plugin_expect == CACHING_SHA2_PASSWORD && auth_response == [0] {
+                    auth_response.clear();
+                }
 
                 if auth_plugin_expect == CACHING_SHA2_PASSWORD
                     && !auth_response.is_empty()
@@ -787,7 +819,24 @@ where
                 let mut needs_default_ok = true;
 
                 if let Some(db_bytes) = handshake.db.as_ref() {
-                    if let Ok(db) = std::str::from_utf8(db_bytes) {
+                    let db = match std::str::from_utf8(db_bytes) {
+                        Ok(db) => db,
+                        Err(_) => {
+                            writers::write_err(
+                                ErrorKind::ER_MALFORMED_PACKET,
+                                b"initial database is not valid utf-8",
+                                &mut self.writer,
+                            )
+                            .await?;
+                            self.writer.flush_all().await?;
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "initial database is not valid utf-8",
+                            )
+                            .into());
+                        }
+                    };
+                    {
                         let w = InitWriter {
                             client_capabilities: self.client_capabilities,
                             writer: &mut self.writer,
@@ -938,10 +987,16 @@ where
                                     Ok(p) => p,
                                     Err(e) => {
                                         state.long_data.clear();
+                                        let kind = if e.get_ref().is_some_and(|cause| {
+                                            cause.is::<params::IncompatibleLongData>()
+                                        }) {
+                                            ErrorKind::ER_WRONG_ARGUMENTS
+                                        } else {
+                                            ErrorKind::ER_MALFORMED_PACKET
+                                        };
                                         writers::write_err(
-                                            ErrorKind::ER_MALFORMED_PACKET,
-                                            format!("malformed execute parameters: {}", e)
-                                                .as_bytes(),
+                                            kind,
+                                            format!("invalid execute parameters: {}", e).as_bytes(),
                                             &mut self.writer,
                                         )
                                         .await?;

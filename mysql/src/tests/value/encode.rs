@@ -17,6 +17,59 @@ use crate::{Column, ColumnFlags, ColumnType};
 use chrono::{self, TimeZone};
 use std::time;
 
+#[test]
+fn mysql_date_values_encode_without_chrono_restrictions() {
+    use myc::value::Value;
+    let column = Column {
+        table: String::new(),
+        column: String::new(),
+        collen: 0,
+        coltype: ColumnType::MYSQL_TYPE_DATETIME,
+        colflags: ColumnFlags::empty(),
+    };
+    for (value, text, binary) in [
+        (
+            Value::Date(0, 0, 0, 0, 0, 0, 0),
+            "0000-00-00 00:00:00",
+            vec![0],
+        ),
+        (
+            Value::Date(2026, 0, 8, 0, 0, 0, 0),
+            "2026-00-08 00:00:00",
+            vec![4, 234, 7, 0, 8],
+        ),
+        (
+            Value::Date(2026, 9, 8, 1, 2, 3, 123456),
+            "2026-09-08 01:02:03.123456",
+            vec![11, 234, 7, 9, 8, 1, 2, 3, 64, 226, 1, 0],
+        ),
+    ] {
+        let mut output = Vec::new();
+        value.to_mysql_text(&mut output).unwrap();
+        assert_eq!(&output[1..], text.as_bytes());
+        output.clear();
+        value.to_mysql_bin(&mut output, &column).unwrap();
+        assert_eq!(output, binary);
+    }
+    let date_column = Column {
+        coltype: ColumnType::MYSQL_TYPE_DATE,
+        ..column
+    };
+    let mut output = Vec::new();
+    Value::Date(2026, 9, 8, 0, 0, 0, 0)
+        .to_mysql_bin(&mut output, &date_column)
+        .unwrap();
+    assert_eq!(output, [4, 234, 7, 9, 8]);
+    for value in [
+        Value::Date(2026, 13, 1, 0, 0, 0, 0),
+        Value::Date(2026, 1, 1, 24, 0, 0, 0),
+        Value::Date(2026, 1, 1, 0, 0, 0, 1000000),
+    ] {
+        assert!(value.to_mysql_text(&mut Vec::new()).is_err());
+        assert!(value.to_mysql_bin(&mut Vec::new(), &date_column).is_err());
+    }
+}
+
 mod roundtrip_text {
     use super::*;
 

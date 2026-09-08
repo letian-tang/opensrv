@@ -16,6 +16,8 @@ use crate::myc::constants::{CapabilityFlags, Command as CommandByte};
 
 #[derive(Debug)]
 pub struct ClientHandshake {
+    // Connection-local challenge; never populated from client input.
+    pub(crate) server_scramble: Option<[u8; 20]>,
     #[allow(dead_code)]
     pub(crate) maxps: u32,
     pub(crate) capabilities: CapabilityFlags,
@@ -51,6 +53,7 @@ pub fn client_handshake(i: &[u8], after_tls: bool) -> nom::IResult<&[u8], Client
             return Ok((
                 i,
                 ClientHandshake {
+                    server_scramble: None,
                     capabilities,
                     maxps,
                     collation: u16::from(collation[0]),
@@ -105,6 +108,7 @@ pub fn client_handshake(i: &[u8], after_tls: bool) -> nom::IResult<&[u8], Client
         Ok((
             i,
             ClientHandshake {
+                server_scramble: None,
                 capabilities,
                 maxps,
                 collation: u16::from(collation[0]),
@@ -138,6 +142,7 @@ pub fn client_handshake(i: &[u8], after_tls: bool) -> nom::IResult<&[u8], Client
         Ok((
             i,
             ClientHandshake {
+                server_scramble: None,
                 capabilities,
                 maxps,
                 collation: 0,

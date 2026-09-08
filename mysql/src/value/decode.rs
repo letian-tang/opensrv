@@ -385,11 +385,18 @@ impl<'a> std::convert::TryFrom<Value<'a>> for Duration {
             let hours = u64::from(v.read_u8()?);
             let minutes = u64::from(v.read_u8()?);
             let seconds = u64::from(v.read_u8()?);
-            let micros = if v.len() == 12 {
+            let micros = if v.len() == 4 {
                 v.read_u32::<LittleEndian>()?
             } else {
                 0
             };
+
+            if micros >= 1_000_000 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "invalid time microseconds",
+                ));
+            }
 
             Ok(Duration::new(
                 days * 86_400 + hours * 3_600 + minutes * 60 + seconds,

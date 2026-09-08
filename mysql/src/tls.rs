@@ -81,7 +81,16 @@ where
     W: AsyncWrite + Send + Unpin,
 {
     let (handshake, seq, client_capabilities, reader) = init_params;
-    let (reader, writer) = switch_to_tls(tls_config, reader, writer).await?;
+    let negotiation = switch_to_tls(tls_config, reader, writer);
+    let (reader, writer) = if let Some(duration) = opts.auth_timeout {
+        tokio::time::timeout(duration, negotiation)
+            .await
+            .map_err(|_| {
+                io::Error::new(io::ErrorKind::TimedOut, "TLS authentication timed out")
+            })??
+    } else {
+        negotiation.await?
+    };
     let reader = PacketReader::new_with_max_packet_size(
         reader,
         opts.max_packet_size

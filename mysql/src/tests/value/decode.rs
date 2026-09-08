@@ -167,3 +167,19 @@ rt!(
     ColumnType::MYSQL_TYPE_BLOB
 );
 rt!(string, &str, "foobar", ColumnType::MYSQL_TYPE_STRING);
+
+#[test]
+fn time_fraction_is_preserved_and_invalid_fraction_rejected() {
+    for micros in [0u32, 1, 123456, 999999, 1000000, u32::MAX] {
+        let mut bytes = vec![12, 0, 0, 0, 0, 0, 0, 0, 1];
+        bytes.extend_from_slice(&micros.to_le_bytes());
+        let value =
+            Value::parse_from(&mut bytes.as_slice(), ColumnType::MYSQL_TYPE_TIME, false).unwrap();
+        let result = time::Duration::try_from(value);
+        if micros < 1000000 {
+            assert_eq!(result.unwrap(), time::Duration::new(1, micros * 1000));
+        } else {
+            assert!(result.is_err());
+        }
+    }
+}

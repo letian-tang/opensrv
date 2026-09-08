@@ -372,6 +372,334 @@ struct WireShim {
     auth_plugin: &'static str,
 }
 
+#[tokio::test]
+async fn auth_switch_uses_saved_scramble_and_preserves_sequence() {
+    for correct in [false, true] {
+        let (mut client, server) = start_wire_server(StrictHandshakeShim {
+            password: b"secret",
+        })
+        .await;
+        let (_, greeting) = read_wire_packet(&mut client).await.unwrap();
+        let salt_start = greeting[1..].iter().position(|&b| b == 0).unwrap() + 6;
+        write_wire_packet(
+            &mut client,
+            1,
+            &handshake_response(opensrv_mysql::MYSQL_NATIVE_PASSWORD, None),
+        )
+        .await
+        .unwrap();
+        let (seq, switch) = timeout(Duration::from_secs(2), read_wire_packet(&mut client))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(seq, 2);
+        let prefix = b"\xfecaching_sha2_password\0";
+        assert!(switch.starts_with(prefix));
+        assert_eq!(switch.len(), prefix.len() + 21);
+        assert_eq!(switch.last(), Some(&0));
+        let salt = &switch[prefix.len()..prefix.len() + 20];
+        assert_eq!(&salt[..8], &greeting[salt_start..salt_start + 8]);
+        assert_eq!(&salt[8..], &greeting[salt_start + 27..salt_start + 39]);
+        let password = if correct {
+            &b"secret"[..]
+        } else {
+            &b"wrong"[..]
+        };
+        let scramble = myc::scramble::scramble_sha256(salt, password).unwrap();
+        write_wire_packet(&mut client, 3, &scramble).await.unwrap();
+        let (seq, packet) = timeout(Duration::from_secs(2), read_wire_packet(&mut client))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(seq, 4);
+        if correct {
+            assert_eq!(packet, [1, 3]);
+            let (seq, ok) = read_wire_packet(&mut client).await.unwrap();
+            assert_eq!(seq, 5);
+            assert_eq!(ok[0], 0);
+            write_wire_packet(&mut client, 0, &[0x0e]).await.unwrap();
+            assert_eq!(read_wire_packet(&mut client).await.unwrap().0, 1);
+            write_wire_packet(&mut client, 0, &[1]).await.unwrap();
+        } else {
+            assert_eq!(packet[0], 0xff);
+            assert_eq!(
+                u16::from_le_bytes([packet[1], packet[2]]),
+                ErrorKind::ER_ACCESS_DENIED_NO_PASSWORD_ERROR as u16
+            );
+        }
+        let result = timeout(Duration::from_secs(2), server)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.is_ok(), correct);
+    }
+}
+
+#[tokio::test]
+async fn auth_switch_timeout_and_disconnect_terminate_connection_task() {
+    for disconnect in [false, true] {
+        let (mut client, server) = start_wire_server_with_options(
+            StrictHandshakeShim {
+                password: b"secret",
+            },
+            IntermediaryOptions {
+                auth_timeout: Some(Duration::from_millis(100)),
+                ..Default::default()
+            },
+        )
+        .await;
+        read_wire_packet(&mut client).await.unwrap();
+        write_wire_packet(
+            &mut client,
+            1,
+            &handshake_response(opensrv_mysql::MYSQL_NATIVE_PASSWORD, None),
+        )
+        .await
+        .unwrap();
+        let (seq, packet) = read_wire_packet(&mut client).await.unwrap();
+        assert_eq!(seq, 2);
+        assert_eq!(packet[0], 0xfe);
+        if disconnect {
+            client.shutdown().await.unwrap();
+        }
+        let err = timeout(Duration::from_secs(2), server)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(
+            err.kind(),
+            if disconnect {
+                io::ErrorKind::ConnectionAborted
+            } else {
+                io::ErrorKind::TimedOut
+            }
+        );
+    }
+}
+
+#[tokio::test]
+async fn initial_handshake_timeout_and_truncated_disconnect_are_errors() {
+    for disconnect in [false, true] {
+        let (mut client, server) = start_wire_server_with_options(
+            StrictHandshakeShim { password: b"" },
+            IntermediaryOptions {
+                auth_timeout: Some(Duration::from_millis(100)),
+                ..Default::default()
+            },
+        )
+        .await;
+        read_wire_packet(&mut client).await.unwrap();
+        if disconnect {
+            client.write_all(&[32, 0, 0, 1, 0]).await.unwrap();
+            client.shutdown().await.unwrap();
+        }
+        let err = timeout(Duration::from_secs(2), server)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(
+            err.kind(),
+            if disconnect {
+                io::ErrorKind::UnexpectedEof
+            } else {
+                io::ErrorKind::TimedOut
+            }
+        );
+    }
+}
+
+struct StrictHandshakeShim {
+    password: &'static [u8],
+}
+
+#[tokio::test]
+async fn authentication_uses_the_challenge_from_the_greeting() {
+    let (mut client, server) = start_wire_server(StrictHandshakeShim {
+        password: b"secret",
+    })
+    .await;
+    let (_, greeting) = read_wire_packet(&mut client).await.unwrap();
+    let version_end = greeting[1..].iter().position(|&b| b == 0).unwrap() + 1;
+    let salt_start = version_end + 5;
+    let mut salt = greeting[salt_start..salt_start + 8].to_vec();
+    salt.extend_from_slice(&greeting[salt_start + 27..salt_start + 39]);
+    let response = myc::scramble::scramble_sha256(&salt, b"secret").unwrap();
+    write_wire_packet(
+        &mut client,
+        1,
+        &handshake_response_with_auth(opensrv_mysql::CACHING_SHA2_PASSWORD, None, &response),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        read_wire_packet(&mut client).await.unwrap(),
+        (2, vec![1, 3])
+    );
+    let (seq, ok) = read_wire_packet(&mut client).await.unwrap();
+    assert_eq!((seq, ok[0]), (3, 0));
+    write_wire_packet(&mut client, 0, &[1]).await.unwrap();
+    timeout(Duration::from_secs(2), server)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test]
+async fn handshake_rejects_wrong_initial_and_auth_switch_sequences() {
+    for switched in [false, true] {
+        for bad_seq in [0, 2, 255] {
+            let (mut client, server) =
+                start_wire_server(StrictHandshakeShim { password: b"" }).await;
+            read_wire_packet(&mut client).await.unwrap();
+            if switched {
+                write_wire_packet(
+                    &mut client,
+                    1,
+                    &handshake_response(opensrv_mysql::MYSQL_NATIVE_PASSWORD, None),
+                )
+                .await
+                .unwrap();
+                assert_eq!(read_wire_packet(&mut client).await.unwrap().0, 2);
+                write_wire_packet(&mut client, bad_seq, &[]).await.unwrap();
+            } else {
+                write_wire_packet(
+                    &mut client,
+                    bad_seq,
+                    &handshake_response(opensrv_mysql::CACHING_SHA2_PASSWORD, None),
+                )
+                .await
+                .unwrap();
+            }
+            let err = timeout(Duration::from_secs(2), server)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        }
+    }
+}
+
+#[async_trait]
+impl AsyncMysqlShim<BufWriter<OwnedWriteHalf>> for StrictHandshakeShim {
+    type Error = io::Error;
+    fn salt(&self) -> [u8; 20] {
+        // Deliberately changes on every invocation, including within one connection.
+        static NEXT: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(1);
+        [NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed); 20]
+    }
+    fn default_auth_plugin(&self) -> &str {
+        opensrv_mysql::CACHING_SHA2_PASSWORD
+    }
+    async fn auth_plugin_for_username(&self, _: &[u8]) -> &'static str {
+        opensrv_mysql::CACHING_SHA2_PASSWORD
+    }
+    async fn authenticate(&self, _: &str, _: &[u8], salt: &[u8], data: &[u8]) -> bool {
+        opensrv_mysql::verify_caching_sha2_password(self.password, salt, data)
+    }
+    async fn on_init<'a>(
+        &'a mut self,
+        _: &'a str,
+        _: InitWriter<'a, BufWriter<OwnedWriteHalf>>,
+    ) -> io::Result<()> {
+        panic!("invalid initial database must not reach on_init")
+    }
+    async fn on_prepare<'a>(
+        &'a mut self,
+        _: &'a str,
+        _: StatementMetaWriter<'a, BufWriter<OwnedWriteHalf>>,
+    ) -> io::Result<()> {
+        unreachable!()
+    }
+    async fn on_execute<'a>(
+        &'a mut self,
+        _: u32,
+        _: ParamParser<'a>,
+        _: QueryResultWriter<'a, BufWriter<OwnedWriteHalf>>,
+    ) -> io::Result<()> {
+        unreachable!()
+    }
+    async fn on_close<'a>(&'a mut self, _: u32) {}
+    async fn on_query<'a>(
+        &'a mut self,
+        _: &'a str,
+        _: QueryResultWriter<'a, BufWriter<OwnedWriteHalf>>,
+    ) -> io::Result<()> {
+        unreachable!()
+    }
+}
+
+#[tokio::test]
+async fn caching_sha2_nul_auth_is_verified_as_empty_password() {
+    for (password, accepted) in [(&b""[..], true), (&b"secret"[..], false)] {
+        let (mut client, server) = start_wire_server(StrictHandshakeShim { password }).await;
+        read_wire_packet(&mut client).await.unwrap();
+        write_wire_packet(
+            &mut client,
+            1,
+            &handshake_response_with_auth(opensrv_mysql::CACHING_SHA2_PASSWORD, None, &[0]),
+        )
+        .await
+        .unwrap();
+        let (seq, packet) = timeout(Duration::from_secs(2), read_wire_packet(&mut client))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(seq, 2);
+        assert_eq!(packet[0], if accepted { 0 } else { 0xff });
+        if accepted {
+            write_wire_packet(&mut client, 0, &[1]).await.unwrap();
+        }
+        let result = timeout(Duration::from_secs(2), server)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.is_ok(), accepted);
+    }
+}
+
+#[tokio::test]
+async fn invalid_initial_database_fails_handshake_without_init() {
+    for require_db in [false, true] {
+        let (mut client, server) = start_wire_server_with_options(
+            StrictHandshakeShim { password: b"" },
+            IntermediaryOptions {
+                reject_connection_on_dbname_absence: require_db,
+                ..Default::default()
+            },
+        )
+        .await;
+        read_wire_packet(&mut client).await.unwrap();
+        let mut response =
+            handshake_response(opensrv_mysql::CACHING_SHA2_PASSWORD, Some("invalid_db"));
+        let offset = response
+            .windows(10)
+            .position(|w| w == b"invalid_db")
+            .unwrap();
+        response[offset] = 0xff;
+        write_wire_packet(&mut client, 1, &response).await.unwrap();
+        let (seq, packet) = timeout(Duration::from_secs(2), read_wire_packet(&mut client))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(seq, 2);
+        assert_eq!(packet[0], 0xff);
+        assert_eq!(
+            u16::from_le_bytes([packet[1], packet[2]]),
+            ErrorKind::ER_MALFORMED_PACKET as u16
+        );
+        let result = timeout(Duration::from_secs(2), server)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidData);
+        assert!(read_wire_packet(&mut client).await.is_err());
+    }
+}
+
 #[async_trait]
 impl AsyncMysqlShim<BufWriter<OwnedWriteHalf>> for WireShim {
     type Error = io::Error;
@@ -1031,6 +1359,63 @@ impl AsyncMysqlShim<BufWriter<OwnedWriteHalf>> for ParamRecordingShim {
             io::ErrorKind::Unsupported,
             "query unsupported",
         ))
+    }
+}
+
+#[tokio::test]
+async fn incompatible_long_data_returns_wrong_arguments_and_recovers() {
+    for ty in [3u8, 10] {
+        for null in [0u8, 1] {
+            let recorded = Arc::new(Mutex::new(Vec::new()));
+            let (mut client, server) = start_wire_server(ParamRecordingShim {
+                recorded: Arc::clone(&recorded),
+            })
+            .await;
+            read_wire_packet(&mut client).await.unwrap();
+            write_wire_packet(
+                &mut client,
+                1,
+                &handshake_response(opensrv_mysql::MYSQL_NATIVE_PASSWORD, None),
+            )
+            .await
+            .unwrap();
+            assert_eq!(read_wire_packet(&mut client).await.unwrap().1[0], 0);
+            prepare_wire_statement(&mut client).await;
+            write_wire_packet(&mut client, 0, b"\x18\x2a\0\0\0\0\0old")
+                .await
+                .unwrap();
+            let mut execute = b"\x17\x2a\0\0\0\0\x01\0\0\0".to_vec();
+            execute.extend_from_slice(&[null, 1, ty, 0]);
+            write_wire_packet(&mut client, 0, &execute).await.unwrap();
+            let (seq, err) = read_wire_packet(&mut client).await.unwrap();
+            assert_eq!(seq, 1);
+            assert_eq!(err[0], 0xff);
+            assert_eq!(
+                u16::from_le_bytes([err[1], err[2]]),
+                ErrorKind::ER_WRONG_ARGUMENTS as u16
+            );
+            assert_eq!(&err[3..9], b"#HY000");
+            assert!(recorded.lock().unwrap().is_empty());
+            write_wire_packet(&mut client, 0, &[0x0e]).await.unwrap();
+            let (seq, ok) = read_wire_packet(&mut client).await.unwrap();
+            assert_eq!((seq, ok[0]), (1, 0));
+            write_wire_packet(
+                &mut client,
+                0,
+                b"\x17\x2a\0\0\0\0\x01\0\0\0\0\x01\xfd\0\x03new",
+            )
+            .await
+            .unwrap();
+            let (seq, ok) = read_wire_packet(&mut client).await.unwrap();
+            assert_eq!((seq, ok[0]), (1, 0));
+            assert_eq!(*recorded.lock().unwrap(), vec![b"new".to_vec()]);
+            write_wire_packet(&mut client, 0, &[1]).await.unwrap();
+            timeout(Duration::from_secs(2), server)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+        }
     }
 }
 

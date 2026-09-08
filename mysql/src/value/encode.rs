@@ -569,6 +569,17 @@ impl ToMysqlValue for Duration {
     }
 }
 
+// MySQL permits zero date components that chrono cannot represent.
+fn validate_mysql_date(y: u16, mo: u8, d: u8, h: u8, mi: u8, s: u8, us: u32) -> io::Result<()> {
+    if y > 9999 || mo > 12 || d > 31 || h > 23 || mi > 59 || s > 59 || us > 999999 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid MySQL date fields",
+        ));
+    }
+    Ok(())
+}
+
 impl ToMysqlValue for myc::value::Value {
     #[allow(clippy::many_single_char_names)]
     fn to_mysql_text<W: Write>(&self, w: &mut W) -> io::Result<()> {
@@ -580,11 +591,12 @@ impl ToMysqlValue for myc::value::Value {
             myc::value::Value::Float(f) => f.to_mysql_text(w),
             myc::value::Value::Double(f) => f.to_mysql_text(w),
             myc::value::Value::Date(y, mo, d, h, mi, s, us) => {
-                NaiveDate::from_ymd_opt(i32::from(y), u32::from(mo), u32::from(d))
-                    .unwrap()
-                    .and_hms_micro_opt(u32::from(h), u32::from(mi), u32::from(s), us)
-                    .unwrap()
-                    .to_mysql_text(w)
+                validate_mysql_date(y, mo, d, h, mi, s, us)?;
+                let mut text = format!("{y:04}-{mo:02}-{d:02} {h:02}:{mi:02}:{s:02}");
+                if us != 0 {
+                    text.push_str(&format!(".{us:06}"));
+                }
+                w.write_lenenc_str(text.as_bytes()).map(|_| ())
             }
             myc::value::Value::Time(neg, d, h, m, s, us) => {
                 if neg {
@@ -644,11 +656,36 @@ impl ToMysqlValue for myc::value::Value {
             myc::value::Value::Float(f) => f.to_mysql_bin(w, c),
             myc::value::Value::Double(f) => f.to_mysql_bin(w, c),
             myc::value::Value::Date(y, mo, d, h, mi, s, us) => {
-                NaiveDate::from_ymd_opt(i32::from(y), u32::from(mo), u32::from(d))
-                    .unwrap()
-                    .and_hms_micro_opt(u32::from(h), u32::from(mi), u32::from(s), us)
-                    .unwrap()
-                    .to_mysql_bin(w, c)
+                validate_mysql_date(y, mo, d, h, mi, s, us)?;
+                let date_only = match c.coltype {
+                    ColumnType::MYSQL_TYPE_DATE => true,
+                    ColumnType::MYSQL_TYPE_DATETIME | ColumnType::MYSQL_TYPE_TIMESTAMP => false,
+                    _ => return Err(bad(self, c)),
+                };
+                if date_only && (h != 0 || mi != 0 || s != 0 || us != 0) {
+                    return Err(bad(self, c));
+                }
+                let len = if us != 0 {
+                    11
+                } else if h != 0 || mi != 0 || s != 0 {
+                    7
+                } else if y != 0 || mo != 0 || d != 0 {
+                    4
+                } else {
+                    0
+                };
+                w.write_u8(len)?;
+                if len >= 4 {
+                    w.write_u16::<LittleEndian>(y)?;
+                    w.write_all(&[mo, d])?;
+                }
+                if len >= 7 {
+                    w.write_all(&[h, mi, s])?;
+                }
+                if len == 11 {
+                    w.write_u32::<LittleEndian>(us)?;
+                }
+                Ok(())
             }
             myc::value::Value::Time(neg, d, h, m, s, us) => {
                 if neg {
