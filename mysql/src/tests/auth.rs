@@ -43,3 +43,12 @@ fn empty_password_matches_empty_auth_response() {
     assert!(verify_caching_sha2_password(b"", salt, &[]));
     assert!(!verify_auth_plugin_data("unknown_plugin", b"", salt, &[]));
 }
+
+#[test]
+fn generated_scrambles_are_fresh_and_protocol_safe() {
+    let first = crate::generate_scramble().unwrap();
+    let second = crate::generate_scramble().unwrap();
+    assert_ne!(first, second);
+    assert!(first.iter().all(|byte| *byte != 0 && *byte != b'$'));
+    assert!(second.iter().all(|byte| *byte != 0 && *byte != b'$'));
+}

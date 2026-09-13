@@ -47,12 +47,21 @@ where
     );
     let mut writer = PacketWriter::new(writer);
     writer.set_flush_threshold(opts.write_high_watermark.unwrap_or(64 * 1024));
+    writer.set_max_packet_size(
+        opts.max_packet_size
+            .unwrap_or(crate::packet_reader::DEFAULT_MAX_PACKET_SIZE),
+    );
+    writer.set_write_timeout(opts.write_timeout);
 
     let process_use_statement_on_query = opts.process_use_statement_on_query;
     let reject_connection_on_dbname_absence = opts.reject_connection_on_dbname_absence;
     let max_long_data_size = opts
         .max_packet_size
         .unwrap_or(crate::packet_reader::DEFAULT_MAX_PACKET_SIZE);
+    let max_connection_long_data_size = opts
+        .max_connection_long_data_size
+        .unwrap_or(max_long_data_size);
+    let max_prepared_statements = opts.max_prepared_statements.unwrap_or(16_382);
     let mut mi = AsyncMysqlIntermediary {
         client_capabilities,
         process_use_statement_on_query,
@@ -60,6 +69,9 @@ where
         read_timeout: opts.read_timeout,
         auth_timeout: opts.auth_timeout,
         max_long_data_size,
+        max_connection_long_data_size,
+        max_prepared_statements,
+        status_flags: opts.initial_status_flags,
         shim,
         reader,
         writer,
@@ -98,12 +110,21 @@ where
     );
     let mut writer = PacketWriter::new(writer);
     writer.set_flush_threshold(opts.write_high_watermark.unwrap_or(64 * 1024));
+    writer.set_max_packet_size(
+        opts.max_packet_size
+            .unwrap_or(crate::packet_reader::DEFAULT_MAX_PACKET_SIZE),
+    );
+    writer.set_write_timeout(opts.write_timeout);
 
     let process_use_statement_on_query = opts.process_use_statement_on_query;
     let reject_connection_on_dbname_absence = opts.reject_connection_on_dbname_absence;
     let max_long_data_size = opts
         .max_packet_size
         .unwrap_or(crate::packet_reader::DEFAULT_MAX_PACKET_SIZE);
+    let max_connection_long_data_size = opts
+        .max_connection_long_data_size
+        .unwrap_or(max_long_data_size);
+    let max_prepared_statements = opts.max_prepared_statements.unwrap_or(16_382);
     let mut mi = AsyncMysqlIntermediary {
         client_capabilities,
         process_use_statement_on_query,
@@ -111,6 +132,9 @@ where
         read_timeout: opts.read_timeout,
         auth_timeout: opts.auth_timeout,
         max_long_data_size,
+        max_connection_long_data_size,
+        max_prepared_statements,
+        status_flags: opts.initial_status_flags,
         shim,
         reader,
         writer,

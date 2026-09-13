@@ -19,6 +19,7 @@ use std::io::IoSlice;
 
 use crate::U24_MAX;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
+use tokio::time::{timeout, Duration};
 
 /// The writer of mysql packet.
 /// - behaves as a sync writer, while build the packet
@@ -28,6 +29,7 @@ pub struct PacketWriter<W> {
     packet_builder: PacketBuilder,
     output_stream: W,
     flush_threshold: usize,
+    write_timeout: Option<Duration>,
 }
 
 // exports the internal builder as sync Write
@@ -47,6 +49,7 @@ impl<W> PacketWriter<W> {
             packet_builder: PacketBuilder::new(),
             output_stream,
             flush_threshold: 64 * 1024,
+            write_timeout: None,
         }
     }
     pub fn set_seq(&mut self, seq: u8) {
@@ -55,6 +58,14 @@ impl<W> PacketWriter<W> {
 
     pub fn set_flush_threshold(&mut self, flush_threshold: usize) {
         self.flush_threshold = flush_threshold;
+    }
+
+    pub fn set_max_packet_size(&mut self, max_packet_size: usize) {
+        self.packet_builder.max_packet_size = max_packet_size;
+    }
+
+    pub fn set_write_timeout(&mut self, write_timeout: Option<Duration>) {
+        self.write_timeout = write_timeout;
     }
 }
 
@@ -78,7 +89,15 @@ impl<W: AsyncWrite + Unpin> PacketWriter<W> {
                 [IoSlice::new(&chunk[chunk_offset..]), IoSlice::new(&[])]
             };
 
-            let written = self.output_stream.write_vectored(&slices).await?;
+            let written = if let Some(duration) = self.write_timeout {
+                timeout(duration, self.output_stream.write_vectored(&slices))
+                    .await
+                    .map_err(|_| {
+                        io::Error::new(io::ErrorKind::TimedOut, "timed out writing MySQL packet")
+                    })??
+            } else {
+                self.output_stream.write_vectored(&slices).await?
+            };
             if written == 0 {
                 return Err(io::Error::new(
                     io::ErrorKind::WriteZero,
@@ -116,7 +135,7 @@ impl<W: AsyncWrite + Unpin> PacketWriter<W> {
             }
 
             if should_flush {
-                self.output_stream.flush().await?;
+                self.flush_output().await?;
             }
 
             Ok(())
@@ -126,7 +145,19 @@ impl<W: AsyncWrite + Unpin> PacketWriter<W> {
     }
 
     pub async fn flush_all(&mut self) -> io::Result<()> {
-        self.output_stream.flush().await
+        self.flush_output().await
+    }
+
+    async fn flush_output(&mut self) -> io::Result<()> {
+        if let Some(duration) = self.write_timeout {
+            timeout(duration, self.output_stream.flush())
+                .await
+                .map_err(|_| {
+                    io::Error::new(io::ErrorKind::TimedOut, "timed out flushing MySQL packet")
+                })?
+        } else {
+            self.output_stream.flush().await
+        }
     }
 }
 
@@ -135,12 +166,26 @@ impl<W: AsyncWrite + Unpin> PacketWriter<W> {
 struct PacketBuilder {
     buffer: Vec<u8>,
     seq: u8,
+    max_packet_size: usize,
 }
 
 impl Write for PacketBuilder {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         // Here we take them all, and split them into raw packets later in `end_packet` if the size
         // of buffer is larger than max payload size (16MB)
+        let new_len =
+            self.buffer.len().checked_add(buf.len()).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "packet size overflow")
+            })?;
+        if new_len > self.max_packet_size {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "outgoing MySQL packet exceeds configured limit: {} bytes > {} bytes",
+                    new_len, self.max_packet_size
+                ),
+            ));
+        }
         self.buffer.extend(buf);
         Ok(buf.len())
     }
@@ -155,6 +200,7 @@ impl PacketBuilder {
         PacketBuilder {
             buffer: vec![],
             seq: 0,
+            max_packet_size: usize::MAX,
         }
     }
 
@@ -264,5 +310,43 @@ mod tests {
         writer.end_packet().await.unwrap();
 
         assert_eq!(writer.output_stream.flushes, 1);
+    }
+
+    #[test]
+    fn outgoing_packet_limit_is_enforced_before_allocation() {
+        let mut writer = PacketWriter::new(PartialAsyncWrite::new(1024));
+        writer.set_max_packet_size(4);
+        writer.write_all(b"four").unwrap();
+        let error = writer.write_all(b"!").unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    struct PendingWrite;
+
+    impl AsyncWrite for PendingWrite {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Pending
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Pending
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn write_timeout_terminates_stalled_client() {
+        let mut writer = PacketWriter::new(PendingWrite);
+        writer.set_write_timeout(Some(Duration::from_millis(10)));
+        writer.write_all(b"payload").unwrap();
+        let error = writer.end_packet().await.unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
     }
 }

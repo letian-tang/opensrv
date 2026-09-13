@@ -24,7 +24,7 @@ use tokio::io::AsyncWrite;
 const BIN_GENERAL_CI: u16 = 0x3f;
 
 fn column_charset(column: &Column) -> u16 {
-    use crate::myc::constants::UTF8_GENERAL_CI;
+    use crate::myc::constants::UTF8MB4_GENERAL_CI;
 
     if column
         .colflags
@@ -50,7 +50,7 @@ fn column_charset(column: &Column) -> u16 {
             | ColumnType::MYSQL_TYPE_SET
             | ColumnType::MYSQL_TYPE_JSON
     ) {
-        UTF8_GENERAL_CI
+        UTF8MB4_GENERAL_CI
     } else {
         BIN_GENERAL_CI
     }
@@ -297,8 +297,8 @@ mod tests {
     }
 
     #[test]
-    fn column_charset_defaults_to_utf8() {
-        use crate::myc::constants::UTF8_GENERAL_CI;
+    fn column_charset_defaults_to_utf8mb4() {
+        use crate::myc::constants::UTF8MB4_GENERAL_CI;
 
         let column = Column {
             table: "t".into(),
@@ -308,7 +308,7 @@ mod tests {
             colflags: ColumnFlags::empty(),
         };
 
-        assert_eq!(column_charset(&column), UTF8_GENERAL_CI);
+        assert_eq!(column_charset(&column), UTF8MB4_GENERAL_CI);
     }
 
     #[test]

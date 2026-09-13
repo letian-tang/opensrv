@@ -27,6 +27,8 @@ extern crate mysql_common as myc;
 use std::collections::HashMap;
 use std::io;
 use std::io::Write;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -113,6 +115,30 @@ const SCRAMBLE_SIZE: usize = 20;
 const CACHING_SHA2_DIGEST_LENGTH: usize = 32;
 pub const MYSQL_NATIVE_PASSWORD: &str = "mysql_native_password";
 pub const CACHING_SHA2_PASSWORD: &str = "caching_sha2_password";
+static NEXT_CONNECTION_ID: AtomicU32 = AtomicU32::new(1);
+
+/// Generate a fresh authentication challenge suitable for a MySQL handshake.
+pub fn generate_scramble() -> io::Result<[u8; SCRAMBLE_SIZE]> {
+    let mut scramble = [0; SCRAMBLE_SIZE];
+    getrandom::fill(&mut scramble).map_err(io::Error::other)?;
+    for byte in &mut scramble {
+        if *byte == b'\0' || *byte == b'$' {
+            *byte = byte.wrapping_add(1);
+        }
+    }
+    Ok(scramble)
+}
+
+fn ensure_response_completed(completion: &Arc<AtomicBool>, command: &str) -> io::Result<()> {
+    if completion.load(Ordering::Acquire) {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("backend returned without completing {command} response"),
+        ))
+    }
+}
 
 fn command_parse_error(packet: &[u8]) -> (ErrorKind, String) {
     if packet.is_empty() {
@@ -133,6 +159,7 @@ fn command_parse_error(packet: &[u8]) -> (ErrorKind, String) {
                 || x == CommandByte::COM_STMT_SEND_LONG_DATA as u8
                 || x == CommandByte::COM_STMT_CLOSE as u8
                 || x == CommandByte::COM_STMT_RESET as u8
+                || x == CommandByte::COM_RESET_CONNECTION as u8
                 || x == CommandByte::COM_QUIT as u8
                 || x == CommandByte::COM_PING as u8
         );
@@ -195,7 +222,7 @@ pub trait AsyncMysqlShim<W: Send> {
 
     /// Connection id
     fn connect_id(&self) -> u32 {
-        u32::from_le_bytes([0x08, 0x00, 0x00, 0x00])
+        NEXT_CONNECTION_ID.fetch_add(1, Ordering::Relaxed)
     }
 
     /// get auth plugin
@@ -210,15 +237,9 @@ pub trait AsyncMysqlShim<W: Send> {
 
     /// Default salt(scramble) for auth plugin
     fn salt(&self) -> [u8; SCRAMBLE_SIZE] {
-        let bs = ";X,po_k}>o6^Wz!/kM}N".as_bytes();
-        let mut scramble: [u8; SCRAMBLE_SIZE] = [0; SCRAMBLE_SIZE];
-        for i in 0..SCRAMBLE_SIZE {
-            scramble[i] = bs[i];
-            if scramble[i] == b'\0' || scramble[i] == b'$' {
-                scramble[i] += 1;
-            }
-        }
-        scramble
+        // Authentication is denied by default. If the OS RNG is unavailable, return an
+        // unusable challenge rather than panic in a connection task.
+        generate_scramble().unwrap_or([0; SCRAMBLE_SIZE])
     }
 
     /// Authenticate using the specified plugin.
@@ -232,7 +253,7 @@ pub trait AsyncMysqlShim<W: Send> {
         _salt: &[u8],
         _auth_data: &[u8],
     ) -> bool {
-        true
+        false
     }
 
     /// Called when the client issues a request to prepare `query` for later execution.
@@ -263,6 +284,15 @@ pub trait AsyncMysqlShim<W: Send> {
     async fn on_close<'a>(&'a mut self, stmt: u32)
     where
         W: 'async_trait;
+
+    /// Reset backend session state for `COM_RESET_CONNECTION`.
+    ///
+    /// Return `true` only after transactions, session variables, and other connection-local
+    /// state have been restored. The default keeps the command unsupported rather than falsely
+    /// acknowledging an incomplete reset.
+    async fn on_reset_connection(&mut self) -> Result<bool, Self::Error> {
+        Ok(false)
+    }
 
     /// Called when the client issues a query for immediate execution.
     ///
@@ -320,7 +350,7 @@ pub trait AsyncMysqlShim<W: Send> {
 }
 
 /// The options which passed to AsyncMysqlIntermediary struct
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IntermediaryOptions {
     /// process use statement on the on_query handler
     pub process_use_statement_on_query: bool,
@@ -330,15 +360,48 @@ pub struct IntermediaryOptions {
     pub read_buffer_size: Option<usize>,
     /// Optional write buffer size for buffered convenience entrypoints.
     pub write_buffer_size: Option<usize>,
-    /// Hard protocol-layer ceiling for a single logical packet assembled from the wire.
+    /// Hard protocol-layer ceiling for a single incoming or outgoing logical packet.
     /// This also bounds accumulated `COM_STMT_SEND_LONG_DATA` bytes per statement.
     pub max_packet_size: Option<usize>,
     /// Optional timeout applied when waiting for the next client packet after authentication.
     pub read_timeout: Option<Duration>,
     /// Optional timeout applied during handshake and authentication packet exchange.
     pub auth_timeout: Option<Duration>,
+    /// Optional timeout applied to packet writes and flushes.
+    pub write_timeout: Option<Duration>,
     /// Flush underlying buffered writers once a packet payload reaches this threshold.
     pub write_high_watermark: Option<usize>,
+    /// Maximum number of prepared statements retained by one connection.
+    pub max_prepared_statements: Option<usize>,
+    /// Aggregate `COM_STMT_SEND_LONG_DATA` bytes retained by one connection.
+    pub max_connection_long_data_size: Option<usize>,
+    /// Status flags advertised in the initial handshake.
+    pub initial_status_flags: StatusFlags,
+    /// Character set/collation advertised in the initial handshake.
+    pub initial_collation: u8,
+    /// Advertise and enforce support for multiple result sets.
+    pub enable_multi_results: bool,
+}
+
+impl Default for IntermediaryOptions {
+    fn default() -> Self {
+        Self {
+            process_use_statement_on_query: false,
+            reject_connection_on_dbname_absence: false,
+            read_buffer_size: None,
+            write_buffer_size: None,
+            max_packet_size: None,
+            read_timeout: None,
+            auth_timeout: None,
+            write_timeout: Some(Duration::from_secs(60)),
+            write_high_watermark: None,
+            max_prepared_statements: None,
+            max_connection_long_data_size: None,
+            initial_status_flags: StatusFlags::SERVER_STATUS_AUTOCOMMIT,
+            initial_collation: myc::constants::UTF8MB4_GENERAL_CI as u8,
+            enable_multi_results: true,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -360,6 +423,9 @@ pub struct AsyncMysqlIntermediary<B, S: AsyncRead + Unpin, W> {
     read_timeout: Option<Duration>,
     auth_timeout: Option<Duration>,
     max_long_data_size: usize,
+    max_connection_long_data_size: usize,
+    max_prepared_statements: usize,
+    status_flags: StatusFlags,
     shim: B,
     reader: packet_reader::PacketReader<S>,
     writer: packet_writer::PacketWriter<W>,
@@ -397,6 +463,10 @@ where
         let process_use_statement_on_query = opts.process_use_statement_on_query;
         let reject_connection_on_dbname_absence = opts.reject_connection_on_dbname_absence;
         let max_long_data_size = opts.max_packet_size.unwrap_or(DEFAULT_MAX_PACKET_SIZE);
+        let max_connection_long_data_size = opts
+            .max_connection_long_data_size
+            .unwrap_or(max_long_data_size);
+        let max_prepared_statements = opts.max_prepared_statements.unwrap_or(16_382);
         let (_, (handshake, seq, client_capabilities, input_stream)) =
             AsyncMysqlIntermediary::init_before_ssl_with_options(
                 &mut shim,
@@ -414,6 +484,8 @@ where
         );
         let mut writer = PacketWriter::new(output_stream);
         writer.set_flush_threshold(opts.write_high_watermark.unwrap_or(64 * 1024));
+        writer.set_max_packet_size(opts.max_packet_size.unwrap_or(DEFAULT_MAX_PACKET_SIZE));
+        writer.set_write_timeout(opts.write_timeout);
 
         let mut mi = AsyncMysqlIntermediary {
             client_capabilities,
@@ -422,6 +494,9 @@ where
             read_timeout: opts.read_timeout,
             auth_timeout: opts.auth_timeout,
             max_long_data_size,
+            max_connection_long_data_size,
+            max_prepared_statements,
+            status_flags: opts.initial_status_flags,
             shim,
             reader,
             writer,
@@ -515,12 +590,20 @@ where
         bool,
         (ClientHandshake, u8, CapabilityFlags, PacketReader<R>),
     )> {
+        if config.scramble.iter().any(|byte| matches!(*byte, 0 | b'$')) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "authentication challenge contains a protocol delimiter",
+            ));
+        }
         let mut reader = PacketReader::new_with_max_packet_size(
             input_stream,
             opts.max_packet_size.unwrap_or(DEFAULT_MAX_PACKET_SIZE),
         );
         let mut writer = PacketWriter::new(output_stream);
         writer.set_flush_threshold(opts.write_high_watermark.unwrap_or(64 * 1024));
+        writer.set_max_packet_size(opts.max_packet_size.unwrap_or(DEFAULT_MAX_PACKET_SIZE));
+        writer.set_write_timeout(opts.write_timeout);
         // https://dev.mysql.com/doc/internals/en/connection-phase-packets.html#packet-Protocol::HandshakeV10
         writer.write_all(&[10])?; // protocol 10
 
@@ -530,13 +613,18 @@ where
         // connection_id (4 bytes)
         writer.write_all(&config.connection_id.to_le_bytes())?;
 
-        let server_capabilities = CapabilityFlags::CLIENT_PROTOCOL_41
+        let mut server_capabilities = CapabilityFlags::CLIENT_PROTOCOL_41
             | CapabilityFlags::CLIENT_SECURE_CONNECTION
             | CapabilityFlags::CLIENT_PLUGIN_AUTH
             | CapabilityFlags::CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA
             | CapabilityFlags::CLIENT_CONNECT_WITH_DB
             | CapabilityFlags::CLIENT_SESSION_TRACK
             | CapabilityFlags::CLIENT_DEPRECATE_EOF;
+
+        if opts.enable_multi_results {
+            server_capabilities |=
+                CapabilityFlags::CLIENT_MULTI_RESULTS | CapabilityFlags::CLIENT_PS_MULTI_RESULTS;
+        }
 
         #[cfg(feature = "tls")]
         let server_capabilities = if tls_conf.is_some() {
@@ -554,8 +642,8 @@ where
 
         writer.write_all(&server_capabilities_vec[..2])?; // The lower 2 bytes of the Capabilities Flags, 0x42
                                                           // self.writer.write_all(&[0x00, 0x42])?;
-        writer.write_all(&[0x21])?; // UTF8_GENERAL_CI
-        writer.write_all(&[0x00, 0x00])?; // status_flags
+        writer.write_all(&[opts.initial_collation])?;
+        writer.write_all(&opts.initial_status_flags.bits().to_le_bytes())?;
         writer.write_all(&server_capabilities_vec[2..4])?; // The upper 2 bytes of the Capabilities Flags
 
         if default_auth_plugin.is_empty() {
@@ -590,8 +678,7 @@ where
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "unexpected initial handshake sequence",
-            )
-            .into());
+            ));
         }
         let mut handshake = commands::client_handshake(&handshake, false)
             .map_err(|e| match e {
@@ -715,7 +802,7 @@ where
                 return Err(err.into());
             }
 
-            self.client_capabilities = handshake.capabilities;
+            self.client_capabilities &= handshake.capabilities;
             let mut auth_response = handshake.auth_response.clone();
             if let Some(username) = &handshake.username {
                 let auth_plugin_expect = self.shim.auth_plugin_for_username(username).await;
@@ -837,11 +924,15 @@ where
                         }
                     };
                     {
+                        let completion = Arc::new(AtomicBool::new(false));
                         let w = InitWriter {
                             client_capabilities: self.client_capabilities,
+                            status_flags: self.status_flags,
                             writer: &mut self.writer,
+                            completion: Arc::clone(&completion),
                         };
                         self.shim.on_init(db, w).await?;
+                        ensure_response_completed(&completion, "initial database")?;
                         needs_default_ok = false;
                     }
                 } else if self.reject_connection_on_dbname_absence {
@@ -863,7 +954,10 @@ where
                     writers::write_ok_packet(
                         &mut self.writer,
                         self.client_capabilities,
-                        OkResponse::default(),
+                        OkResponse {
+                            status_flags: self.status_flags,
+                            ..Default::default()
+                        },
                     )
                     .await?;
                 }
@@ -879,6 +973,7 @@ where
         use crate::commands::Command;
 
         let mut stmts: HashMap<u32, _> = HashMap::new();
+        let mut total_long_data_size = 0usize;
         while let Some((seq, packet)) =
             read_packet_with_timeout(&mut self.reader, self.read_timeout).await?
         {
@@ -917,32 +1012,54 @@ where
                                 }
                             };
                             if q_str.starts_with("SELECT @@") || q_str.starts_with("select @@") {
-                                let w = QueryResultWriter::new(
+                                let (w, completion) = QueryResultWriter::new_tracked(
                                     &mut self.writer,
                                     false,
                                     self.client_capabilities,
+                                    self.status_flags,
                                 );
                                 self.shim.on_system_variable(q_str, w).await?;
+                                ensure_response_completed(&completion, "query")?;
                             } else if !self.process_use_statement_on_query
                                 && (q_str.starts_with("USE ") || q_str.starts_with("use "))
                             {
+                                let completion = Arc::new(AtomicBool::new(false));
                                 let w = InitWriter {
                                     client_capabilities: self.client_capabilities,
+                                    status_flags: self.status_flags,
                                     writer: &mut self.writer,
+                                    completion: Arc::clone(&completion),
                                 };
                                 let schema = &q_str["USE ".len()..];
                                 let schema = schema.trim().trim_end_matches(';').trim_matches('`');
                                 self.shim.on_init(schema, w).await?;
+                                ensure_response_completed(&completion, "USE")?;
                             } else {
-                                let w = QueryResultWriter::new(
+                                let (w, completion) = QueryResultWriter::new_tracked(
                                     &mut self.writer,
                                     false,
                                     self.client_capabilities,
+                                    self.status_flags,
                                 );
                                 self.shim.on_query(q_str, w).await?;
+                                ensure_response_completed(&completion, "query")?;
                             }
                         }
                         Command::Prepare(q) => {
+                            if stmts.len() >= self.max_prepared_statements {
+                                writers::write_err(
+                                    ErrorKind::ER_MAX_PREPARED_STMT_COUNT_REACHED,
+                                    format!(
+                                        "maximum prepared statement count reached: {}",
+                                        self.max_prepared_statements
+                                    )
+                                    .as_bytes(),
+                                    &mut self.writer,
+                                )
+                                .await?;
+                                self.writer.flush_all().await?;
+                                continue;
+                            }
                             let q_str = match ::std::str::from_utf8(q) {
                                 Ok(s) => s,
                                 Err(e) => {
@@ -957,15 +1074,37 @@ where
                                     continue;
                                 }
                             };
+                            let completion = Arc::new(AtomicBool::new(false));
                             let w = StatementMetaWriter {
                                 writer: &mut self.writer,
                                 stmts: &mut stmts,
                                 client_capabilities: self.client_capabilities,
+                                completion: Arc::clone(&completion),
                             };
 
                             self.shim.on_prepare(q_str, w).await?;
+                            ensure_response_completed(&completion, "prepare")?;
                         }
-                        Command::Execute { stmt, params } => {
+                        Command::Execute {
+                            stmt,
+                            flags,
+                            iteration_count,
+                            params,
+                        } => {
+                            if flags != 0 || iteration_count != 1 {
+                                writers::write_err(
+                                    ErrorKind::ER_UNSUPPORTED_PS,
+                                    format!(
+                                        "unsupported COM_STMT_EXECUTE flags ({}) or iteration count ({})",
+                                        flags, iteration_count
+                                    )
+                                    .as_bytes(),
+                                    &mut self.writer,
+                                )
+                                .await?;
+                                self.writer.flush_all().await?;
+                                continue;
+                            }
                             let state = match stmts.get_mut(&stmt) {
                                 Some(s) => s,
                                 None => {
@@ -979,6 +1118,10 @@ where
                                     continue;
                                 }
                             };
+                            let retained_long_data = state
+                                .long_data
+                                .values()
+                                .fold(0usize, |total, value| total.saturating_add(value.len()));
                             if let Some((kind, message)) = state.pending_error.as_ref() {
                                 writers::write_err(*kind, message.as_bytes(), &mut self.writer)
                                     .await?;
@@ -1001,16 +1144,22 @@ where
                                         )
                                         .await?;
                                         self.writer.flush_all().await?;
+                                        total_long_data_size =
+                                            total_long_data_size.saturating_sub(retained_long_data);
                                         continue;
                                     }
                                 };
-                                let w = QueryResultWriter::new(
+                                let (w, completion) = QueryResultWriter::new_tracked(
                                     &mut self.writer,
                                     true,
                                     self.client_capabilities,
+                                    self.status_flags,
                                 );
                                 self.shim.on_execute(stmt, params, w).await?;
+                                ensure_response_completed(&completion, "execute")?;
                                 state.long_data.clear();
+                                total_long_data_size =
+                                    total_long_data_size.saturating_sub(retained_long_data);
                             }
                         }
                         Command::SendLongData { stmt, param, data } => {
@@ -1035,19 +1184,28 @@ where
                                             });
                                         let new_size = current_size
                                             .and_then(|size| size.checked_add(data.len()));
-                                        if let Some(new_size) = new_size {
-                                            if new_size <= self.max_long_data_size {
+                                        let new_connection_size =
+                                            total_long_data_size.checked_add(data.len());
+                                        if let (Some(new_size), Some(new_connection_size)) =
+                                            (new_size, new_connection_size)
+                                        {
+                                            if new_size <= self.max_long_data_size
+                                                && new_connection_size
+                                                    <= self.max_connection_long_data_size
+                                            {
                                                 state
                                                     .long_data
                                                     .entry(param)
                                                     .or_insert_with(Vec::new)
                                                     .extend(data);
+                                                total_long_data_size = new_connection_size;
                                             } else {
                                                 state.pending_error = Some((
                                                     ErrorKind::ER_NET_PACKET_TOO_LARGE,
                                                     format!(
-                                                        "long data exceeds configured limit: {} bytes > {} bytes",
-                                                        new_size, self.max_long_data_size
+                                                        "long data exceeds configured statement/connection limits: {} / {} bytes",
+                                                        self.max_long_data_size,
+                                                        self.max_connection_long_data_size
                                                     ),
                                                 ));
                                             }
@@ -1063,17 +1221,31 @@ where
                         }
                         Command::Close(stmt) => {
                             self.shim.on_close(stmt).await;
-                            stmts.remove(&stmt);
+                            if let Some(state) = stmts.remove(&stmt) {
+                                let removed = state
+                                    .long_data
+                                    .values()
+                                    .fold(0usize, |total, value| total.saturating_add(value.len()));
+                                total_long_data_size = total_long_data_size.saturating_sub(removed);
+                            }
                             // NOTE: spec dictates no response from server
                         }
                         Command::Reset(stmt) => {
                             if let Some(state) = stmts.get_mut(&stmt) {
+                                let removed = state
+                                    .long_data
+                                    .values()
+                                    .fold(0usize, |total, value| total.saturating_add(value.len()));
                                 state.long_data.clear();
                                 state.pending_error = None;
+                                total_long_data_size = total_long_data_size.saturating_sub(removed);
                                 writers::write_ok_packet(
                                     &mut self.writer,
                                     self.client_capabilities,
-                                    OkResponse::default(),
+                                    OkResponse {
+                                        status_flags: self.status_flags,
+                                        ..Default::default()
+                                    },
                                 )
                                 .await?;
                             } else {
@@ -1108,19 +1280,48 @@ where
                                     continue;
                                 }
                             };
+                            let completion = Arc::new(AtomicBool::new(false));
                             let w = InitWriter {
                                 client_capabilities: self.client_capabilities,
+                                status_flags: self.status_flags,
                                 writer: &mut self.writer,
+                                completion: Arc::clone(&completion),
                             };
                             self.shim.on_init(schema_str, w).await?;
+                            ensure_response_completed(&completion, "init database")?;
                         }
                         Command::Ping => {
                             writers::write_ok_packet(
                                 &mut self.writer,
                                 self.client_capabilities,
-                                OkResponse::default(),
+                                OkResponse {
+                                    status_flags: self.status_flags,
+                                    ..Default::default()
+                                },
                             )
                             .await?;
+                        }
+                        Command::ResetConnection => {
+                            if self.shim.on_reset_connection().await? {
+                                stmts.clear();
+                                total_long_data_size = 0;
+                                writers::write_ok_packet(
+                                    &mut self.writer,
+                                    self.client_capabilities,
+                                    OkResponse {
+                                        status_flags: self.status_flags,
+                                        ..Default::default()
+                                    },
+                                )
+                                .await?;
+                            } else {
+                                writers::write_err(
+                                    ErrorKind::ER_UNKNOWN_COM_ERROR,
+                                    b"COM_RESET_CONNECTION is not supported by this backend",
+                                    &mut self.writer,
+                                )
+                                .await?;
+                            }
                         }
                         Command::Quit => {
                             break;

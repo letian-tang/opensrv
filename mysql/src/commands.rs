@@ -180,6 +180,8 @@ pub enum Command<'a> {
     Init(&'a [u8]),
     Execute {
         stmt: u32,
+        flags: u8,
+        iteration_count: u32,
         params: &'a [u8],
     },
     SendLongData {
@@ -188,14 +190,23 @@ pub enum Command<'a> {
         data: &'a [u8],
     },
     Ping,
+    ResetConnection,
     Quit,
 }
 
 pub fn execute(i: &[u8]) -> nom::IResult<&[u8], Command<'_>> {
     let (i, stmt) = nom::number::complete::le_u32(i)?;
-    let (i, _flags) = nom::bytes::complete::take(1u8)(i)?;
-    let (i, _iterations) = nom::number::complete::le_u32(i)?;
-    Ok((&[], Command::Execute { stmt, params: i }))
+    let (i, flags) = nom::number::complete::le_u8(i)?;
+    let (i, iteration_count) = nom::number::complete::le_u32(i)?;
+    Ok((
+        &[],
+        Command::Execute {
+            stmt,
+            flags,
+            iteration_count,
+            params: i,
+        },
+    ))
 }
 
 pub fn send_long_data(i: &[u8]) -> nom::IResult<&[u8], Command<'_>> {
@@ -215,7 +226,7 @@ pub fn parse(i: &[u8]) -> nom::IResult<&[u8], Command<'_>> {
     use nom::bytes::complete::tag;
     use nom::combinator::{map, rest};
     use nom::sequence::preceded;
-    nom::branch::alt((
+    nom::combinator::all_consuming(nom::branch::alt((
         map(
             preceded(tag(&[CommandByte::COM_QUERY as u8]), rest),
             Command::Query,
@@ -253,5 +264,8 @@ pub fn parse(i: &[u8]) -> nom::IResult<&[u8], Command<'_>> {
         ),
         map(tag(&[CommandByte::COM_QUIT as u8]), |_| Command::Quit),
         map(tag(&[CommandByte::COM_PING as u8]), |_| Command::Ping),
-    ))(i)
+        map(tag(&[CommandByte::COM_RESET_CONNECTION as u8]), |_| {
+            Command::ResetConnection
+        }),
+    )))(i)
 }

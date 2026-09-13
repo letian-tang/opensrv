@@ -15,7 +15,7 @@
 use std::io::Cursor;
 
 use crate::commands::*;
-use crate::myc::constants::{CapabilityFlags, UTF8_GENERAL_CI};
+use crate::myc::constants::{CapabilityFlags, Command as CommandByte, UTF8_GENERAL_CI};
 use crate::packet_reader::PacketReader;
 
 #[test]
@@ -127,6 +127,35 @@ fn it_handles_list_fields() {
     assert_eq!(
         cmd,
         Command::ListFields(&b"select @@version_comment limit 1"[..])
+    );
+}
+
+#[test]
+fn execute_preserves_flags_and_iteration_count() {
+    let mut packet = vec![CommandByte::COM_STMT_EXECUTE as u8];
+    packet.extend_from_slice(&42u32.to_le_bytes());
+    packet.push(1);
+    packet.extend_from_slice(&2u32.to_le_bytes());
+    packet.extend_from_slice(b"params");
+
+    assert_eq!(
+        parse(&packet).unwrap().1,
+        Command::Execute {
+            stmt: 42,
+            flags: 1,
+            iteration_count: 2,
+            params: b"params"
+        }
+    );
+}
+
+#[test]
+fn fixed_length_commands_reject_trailing_bytes_and_reset_connection_parses() {
+    assert!(parse(&[CommandByte::COM_PING as u8, 0]).is_err());
+    assert!(parse(&[CommandByte::COM_STMT_CLOSE as u8, 1, 0, 0, 0, 0]).is_err());
+    assert_eq!(
+        parse(&[CommandByte::COM_RESET_CONNECTION as u8]).unwrap().1,
+        Command::ResetConnection
     );
 }
 

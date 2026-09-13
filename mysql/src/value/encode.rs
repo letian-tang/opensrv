@@ -174,8 +174,11 @@ impl ToMysqlValue for u8 {
                 }
             }
             ColumnType::MYSQL_TYPE_TINY => {
-                assert!(!signed);
-                w.write_u8(*self)
+                if signed {
+                    Err(bad(self, c))
+                } else {
+                    w.write_u8(*self)
+                }
             }
             _ => Err(bad(self, c)),
         }
@@ -209,8 +212,11 @@ impl ToMysqlValue for i8 {
                 }
             }
             ColumnType::MYSQL_TYPE_TINY => {
-                assert!(signed);
-                w.write_i8(*self)
+                if signed {
+                    w.write_i8(*self)
+                } else {
+                    Err(bad(self, c))
+                }
             }
             _ => Err(bad(self, c)),
         }
@@ -237,8 +243,11 @@ impl ToMysqlValue for u16 {
                 }
             }
             ColumnType::MYSQL_TYPE_SHORT | ColumnType::MYSQL_TYPE_YEAR => {
-                assert!(!signed);
-                w.write_u16::<LittleEndian>(*self)
+                if signed {
+                    Err(bad(self, c))
+                } else {
+                    w.write_u16::<LittleEndian>(*self)
+                }
             }
             _ => Err(bad(self, c)),
         }
@@ -265,8 +274,11 @@ impl ToMysqlValue for i16 {
                 }
             }
             ColumnType::MYSQL_TYPE_SHORT | ColumnType::MYSQL_TYPE_YEAR => {
-                assert!(signed);
-                w.write_i16::<LittleEndian>(*self)
+                if signed {
+                    w.write_i16::<LittleEndian>(*self)
+                } else {
+                    Err(bad(self, c))
+                }
             }
             _ => Err(bad(self, c)),
         }
@@ -286,8 +298,11 @@ impl ToMysqlValue for u32 {
                 }
             }
             ColumnType::MYSQL_TYPE_LONG | ColumnType::MYSQL_TYPE_INT24 => {
-                assert!(!signed);
-                w.write_u32::<LittleEndian>(*self)
+                if signed {
+                    Err(bad(self, c))
+                } else {
+                    w.write_u32::<LittleEndian>(*self)
+                }
             }
             _ => Err(bad(self, c)),
         }
@@ -307,8 +322,11 @@ impl ToMysqlValue for i32 {
                 }
             }
             ColumnType::MYSQL_TYPE_LONG | ColumnType::MYSQL_TYPE_INT24 => {
-                assert!(signed);
-                w.write_i32::<LittleEndian>(*self)
+                if signed {
+                    w.write_i32::<LittleEndian>(*self)
+                } else {
+                    Err(bad(self, c))
+                }
             }
             _ => Err(bad(self, c)),
         }
@@ -321,8 +339,11 @@ impl ToMysqlValue for u64 {
         let signed = !c.colflags.contains(ColumnFlags::UNSIGNED_FLAG);
         match c.coltype {
             ColumnType::MYSQL_TYPE_LONGLONG => {
-                assert!(!signed);
-                w.write_u64::<LittleEndian>(*self)
+                if signed {
+                    Err(bad(self, c))
+                } else {
+                    w.write_u64::<LittleEndian>(*self)
+                }
             }
             _ => Err(bad(self, c)),
         }
@@ -335,8 +356,11 @@ impl ToMysqlValue for i64 {
         let signed = !c.colflags.contains(ColumnFlags::UNSIGNED_FLAG);
         match c.coltype {
             ColumnType::MYSQL_TYPE_LONGLONG => {
-                assert!(signed);
-                w.write_i64::<LittleEndian>(*self)
+                if signed {
+                    w.write_i64::<LittleEndian>(*self)
+                } else {
+                    Err(bad(self, c))
+                }
             }
             _ => Err(bad(self, c)),
         }
@@ -512,12 +536,22 @@ impl ToMysqlValue for NaiveDateTime {
 }
 
 use std::time::Duration;
+const MYSQL_TIME_MAX_SECONDS: u64 = 838 * 3600 + 59 * 60 + 59;
+
+fn validate_mysql_duration(value: &Duration) -> io::Result<()> {
+    if value.as_secs() > MYSQL_TIME_MAX_SECONDS {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "MySQL TIME exceeds 838:59:59",
+        ));
+    }
+    Ok(())
+}
+
 impl ToMysqlValue for Duration {
     fn to_mysql_text<W: Write>(&self, w: &mut W) -> io::Result<()> {
+        validate_mysql_duration(self)?;
         let s = self.as_secs();
-        //let d = s / (24 * 3600);
-        // assert!(d <= 34);
-        //let h = (s % (24 * 3600)) / 3600;
         let h = s / 3600;
         let m = (s % 3600) / 60;
         let s = s % 60;
@@ -533,40 +567,56 @@ impl ToMysqlValue for Duration {
 
     #[allow(clippy::many_single_char_names)]
     fn to_mysql_bin<W: Write>(&self, w: &mut W, c: &Column) -> io::Result<()> {
+        if c.coltype != ColumnType::MYSQL_TYPE_TIME {
+            return Err(bad(self, c));
+        }
+        validate_mysql_duration(self)?;
         let s = self.as_secs();
         let d = s / (24 * 3600);
-        assert!(d <= 34);
         let h = (s % (24 * 3600)) / 3600;
         let m = (s % 3600) / 60;
         let s = s % 60;
         let us = self.subsec_micros();
 
-        match c.coltype {
-            ColumnType::MYSQL_TYPE_TIME => {
-                if self.as_secs() == 0 && us == 0 {
-                    w.write_u8(0u8)?;
-                } else {
-                    if us != 0 {
-                        w.write_u8(12u8)?;
-                    } else {
-                        w.write_u8(8u8)?;
-                    }
-
-                    w.write_u8(0u8)?; // positive only (for now)
-                    w.write_u32::<LittleEndian>(d as u32)?;
-                    w.write_u8(h as u8)?;
-                    w.write_u8(m as u8)?;
-                    w.write_u8(s as u8)?;
-
-                    if us != 0 {
-                        w.write_u32::<LittleEndian>(us)?;
-                    }
-                }
-                Ok(())
+        if self.as_secs() == 0 && us == 0 {
+            w.write_u8(0u8)?;
+        } else {
+            if us != 0 {
+                w.write_u8(12u8)?;
+            } else {
+                w.write_u8(8u8)?;
             }
-            _ => Err(bad(self, c)),
+
+            w.write_u8(0u8)?; // positive only (for now)
+            w.write_u32::<LittleEndian>(d as u32)?;
+            w.write_u8(h as u8)?;
+            w.write_u8(m as u8)?;
+            w.write_u8(s as u8)?;
+
+            if us != 0 {
+                w.write_u32::<LittleEndian>(us)?;
+            }
         }
+        Ok(())
     }
+}
+
+fn mysql_time_duration(d: u32, h: u8, m: u8, s: u8, us: u32) -> io::Result<Duration> {
+    if h > 23 || m > 59 || s > 59 || us > 999_999 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid MySQL TIME fields",
+        ));
+    }
+    let seconds = u64::from(d)
+        .checked_mul(24 * 3600)
+        .and_then(|value| value.checked_add(u64::from(h) * 3600))
+        .and_then(|value| value.checked_add(u64::from(m) * 60))
+        .and_then(|value| value.checked_add(u64::from(s)))
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "MySQL TIME overflow"))?;
+    let duration = Duration::new(seconds, us * 1_000);
+    validate_mysql_duration(&duration)?;
+    Ok(duration)
 }
 
 // MySQL permits zero date components that chrono cannot represent.
@@ -602,14 +652,7 @@ impl ToMysqlValue for myc::value::Value {
                 if neg {
                     return Err(io::Error::other("negative times not yet supported"));
                 }
-                (chrono::Duration::days(i64::from(d))
-                    + chrono::Duration::hours(i64::from(h))
-                    + chrono::Duration::minutes(i64::from(m))
-                    + chrono::Duration::seconds(i64::from(s))
-                    + chrono::Duration::microseconds(i64::from(us)))
-                .to_std()
-                .expect("only positive times at the moment")
-                .to_mysql_text(w)
+                mysql_time_duration(d, h, m, s, us)?.to_mysql_text(w)
             }
         }
     }
@@ -691,14 +734,7 @@ impl ToMysqlValue for myc::value::Value {
                 if neg {
                     return Err(io::Error::other("negative times not yet supported"));
                 }
-                (chrono::Duration::days(i64::from(d))
-                    + chrono::Duration::hours(i64::from(h))
-                    + chrono::Duration::minutes(i64::from(m))
-                    + chrono::Duration::seconds(i64::from(s))
-                    + chrono::Duration::microseconds(i64::from(us)))
-                .to_std()
-                .expect("only positive times at the moment")
-                .to_mysql_bin(w, c)
+                mysql_time_duration(d, h, m, s, us)?.to_mysql_bin(w, c)
             }
         }
     }

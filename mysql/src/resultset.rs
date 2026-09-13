@@ -15,8 +15,9 @@
 use std::borrow::Borrow;
 use std::collections::HashMap;
 use std::io::{self, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
-use byteorder::WriteBytesExt;
 use mysql_common::constants::{CapabilityFlags, ColumnFlags, StatusFlags};
 use tokio::io::AsyncWrite;
 
@@ -28,13 +29,25 @@ use crate::{Column, ErrorKind, StatementData};
 /// Convenience type for responding to a client `USE <db>` command.
 pub struct InitWriter<'a, W> {
     pub(crate) client_capabilities: CapabilityFlags,
+    pub(crate) status_flags: StatusFlags,
     pub(crate) writer: &'a mut PacketWriter<W>,
+    pub(crate) completion: Arc<AtomicBool>,
 }
 
 impl<'a, W: 'a + AsyncWrite + Unpin> InitWriter<'a, W> {
     /// Tell client that database context has been changed
     pub async fn ok(self) -> io::Result<()> {
-        writers::write_ok_packet(self.writer, self.client_capabilities, OkResponse::default()).await
+        writers::write_ok_packet(
+            self.writer,
+            self.client_capabilities,
+            OkResponse {
+                status_flags: self.status_flags,
+                ..Default::default()
+            },
+        )
+        .await?;
+        self.completion.store(true, Ordering::Release);
+        Ok(())
     }
 
     /// Tell client that there was a problem changing the database context.
@@ -45,7 +58,9 @@ impl<'a, W: 'a + AsyncWrite + Unpin> InitWriter<'a, W> {
     where
         E: Borrow<[u8]> + ?Sized,
     {
-        writers::write_err(kind, msg.borrow(), self.writer).await
+        writers::write_err(kind, msg.borrow(), self.writer).await?;
+        self.completion.store(true, Ordering::Release);
+        Ok(())
     }
 }
 
@@ -59,6 +74,7 @@ pub struct StatementMetaWriter<'a, W> {
     pub(crate) writer: &'a mut PacketWriter<W>,
     pub(crate) stmts: &'a mut HashMap<u32, StatementData>,
     pub(crate) client_capabilities: CapabilityFlags,
+    pub(crate) completion: Arc<AtomicBool>,
 }
 
 impl<'a, W: AsyncWrite + Unpin + 'a> StatementMetaWriter<'a, W> {
@@ -77,14 +93,36 @@ impl<'a, W: AsyncWrite + Unpin + 'a> StatementMetaWriter<'a, W> {
         <CI as IntoIterator>::IntoIter: ExactSizeIterator,
     {
         let params = params.into_iter();
+        let param_count = u16::try_from(params.len()).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "prepared statement has more than 65535 parameters",
+            )
+        })?;
+        let columns = columns.into_iter();
+        u16::try_from(columns.len()).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "prepared statement has more than 65535 result columns",
+            )
+        })?;
+        if self.stmts.contains_key(&id) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("duplicate prepared statement id {id}"),
+            ));
+        }
+        writers::write_prepare_ok(id, params, columns, self.writer, self.client_capabilities)
+            .await?;
         self.stmts.insert(
             id,
             StatementData {
-                params: params.len() as u16,
+                params: param_count,
                 ..Default::default()
             },
         );
-        writers::write_prepare_ok(id, params, columns, self.writer, self.client_capabilities).await
+        self.completion.store(true, Ordering::Release);
+        Ok(())
     }
 
     /// Reply to the client's `PREPARE` with an error.
@@ -92,7 +130,9 @@ impl<'a, W: AsyncWrite + Unpin + 'a> StatementMetaWriter<'a, W> {
     where
         E: Borrow<[u8]> + ?Sized,
     {
-        writers::write_err(kind, msg.borrow(), self.writer).await
+        writers::write_err(kind, msg.borrow(), self.writer).await?;
+        self.completion.store(true, Ordering::Release);
+        Ok(())
     }
 }
 
@@ -122,30 +162,73 @@ pub struct QueryResultWriter<'a, W> {
     pub(crate) client_capabilities: CapabilityFlags,
     pub(crate) writer: &'a mut PacketWriter<W>,
     last_end: Option<Finalizer>,
+    default_status_flags: StatusFlags,
+    completion: Option<Arc<AtomicBool>>,
 }
 
 impl<'a, W: AsyncWrite + Unpin> QueryResultWriter<'a, W> {
+    #[cfg(test)]
     pub(crate) fn new(
         writer: &'a mut PacketWriter<W>,
         is_bin: bool,
         client_capabilities: CapabilityFlags,
+        default_status_flags: StatusFlags,
     ) -> Self {
         QueryResultWriter {
             is_bin,
             client_capabilities,
             writer,
             last_end: None,
+            default_status_flags,
+            completion: None,
         }
     }
 
+    pub(crate) fn new_tracked(
+        writer: &'a mut PacketWriter<W>,
+        is_bin: bool,
+        client_capabilities: CapabilityFlags,
+        default_status_flags: StatusFlags,
+    ) -> (Self, Arc<AtomicBool>) {
+        let completion = Arc::new(AtomicBool::new(false));
+        (
+            QueryResultWriter {
+                is_bin,
+                client_capabilities,
+                writer,
+                last_end: None,
+                default_status_flags,
+                completion: Some(Arc::clone(&completion)),
+            },
+            completion,
+        )
+    }
+
     async fn finalize(&mut self, more_exists: bool) -> io::Result<()> {
-        let mut status = StatusFlags::empty();
+        if more_exists && self.last_end.is_some() {
+            let required = if self.is_bin {
+                CapabilityFlags::CLIENT_PS_MULTI_RESULTS
+            } else {
+                CapabilityFlags::CLIENT_MULTI_RESULTS
+            };
+            if !self.client_capabilities.contains(required) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "client did not negotiate multiple result sets",
+                ));
+            }
+        }
+
+        let mut status = self.default_status_flags;
         if more_exists {
             status.set(StatusFlags::SERVER_MORE_RESULTS_EXISTS, true);
         }
         match self.last_end.take() {
             None => Ok(()),
             Some(Finalizer::Ok(mut ok_packet)) => {
+                if ok_packet.status_flags.is_empty() {
+                    ok_packet.status_flags = self.default_status_flags;
+                }
                 if more_exists {
                     ok_packet
                         .status_flags
@@ -192,13 +275,21 @@ impl<'a, W: AsyncWrite + Unpin> QueryResultWriter<'a, W> {
         E: Borrow<[u8]> + ?Sized,
     {
         self.finalize(true).await?;
-        writers::write_err(kind, msg.borrow(), self.writer).await
+        writers::write_err(kind, msg.borrow(), self.writer).await?;
+        if let Some(completion) = &self.completion {
+            completion.store(true, Ordering::Release);
+        }
+        Ok(())
     }
 
     /// Send the last bits of the last resultset to the client, and indicate that there are no more
     /// resultsets coming.
     pub async fn no_more_results(mut self) -> io::Result<()> {
-        self.finalize(false).await
+        self.finalize(false).await?;
+        if let Some(completion) = &self.completion {
+            completion.store(true, Ordering::Release);
+        }
+        Ok(())
     }
 }
 
@@ -209,11 +300,9 @@ impl<'a, W: AsyncWrite + Unpin> QueryResultWriter<'a, W> {
 /// [`end_row`](struct.RowWriter.html#method.end_row)), or one row at a time (using
 /// [`write_row`](struct.RowWriter.html#method.write_row)).
 ///
-/// This type *may* be dropped without calling
-/// [`write_row`](struct.RowWriter.html#method.write_row) or
-/// [`finish`](struct.RowWriter.html#method.finish). However, in this case, the program may panic
-/// if an I/O error occurs when sending the end-of-records marker to the client. To avoid this,
-/// call [`finish`](struct.RowWriter.html#method.finish) explicitly.
+/// This type must be completed with [`finish`](struct.RowWriter.html#method.finish) or
+/// [`finish_error`](struct.RowWriter.html#method.finish_error). Dropping it does not send an
+/// end-of-records marker, so the client cannot safely continue using the connection.
 #[must_use]
 pub struct RowWriter<'a, W: AsyncWrite + Unpin> {
     client_capabilities: CapabilityFlags,
@@ -271,8 +360,8 @@ where
     ///
     /// If you do not call [`end_row`](struct.RowWriter.html#method.end_row) after the last row,
     /// any errors that occur when writing out the last row will be returned by
-    /// [`finish`](struct.RowWriter.html#method.finish). If you do not call `finish` either, any
-    /// errors will cause a panic when the `RowWriter` is dropped.
+    /// [`finish`](struct.RowWriter.html#method.finish). If you do not call `finish` either, the
+    /// response remains incomplete and the connection cannot be safely reused.
     ///
     /// Note that the row *must* conform to the column specification provided to
     /// [`QueryResultWriter::start`](struct.QueryResultWriter.html#method.start). If it does not,
@@ -288,10 +377,10 @@ where
 
         if self.result.as_mut().unwrap().is_bin {
             if self.col == 0 {
-                self.result.as_mut().unwrap().writer.write_u8(0x00)?;
+                self.data.push(0x00);
 
                 // leave space for nullmap
-                self.data.resize(self.bitmap_len, 0);
+                self.data.resize(1 + self.bitmap_len, 0);
             }
 
             let c = self.columns.get(self.col).ok_or_else(|| {
@@ -310,13 +399,17 @@ where
                     // https://web.archive.org/web/20170404144156/https://dev.mysql.com/doc/internals/en/null-bitmap.html
                     // NULL-bitmap-byte = ((field-pos + offset) / 8)
                     // NULL-bitmap-bit  = ((field-pos + offset) % 8)
-                    self.data[(self.col + 2) / 8] |= 1u8 << ((self.col + 2) % 8);
+                    self.data[1 + (self.col + 2) / 8] |= 1u8 << ((self.col + 2) % 8);
                 }
             } else {
-                v.to_mysql_bin(&mut self.data, c)?;
+                let mut encoded = Vec::new();
+                v.to_mysql_bin(&mut encoded, c)?;
+                self.data.extend_from_slice(&encoded);
             }
         } else {
-            v.to_mysql_text(self.result.as_mut().unwrap().writer)?;
+            let mut encoded = Vec::new();
+            v.to_mysql_text(&mut encoded)?;
+            self.data.extend_from_slice(&encoded);
         }
         self.col += 1;
         Ok(())
@@ -336,14 +429,12 @@ where
             ));
         }
 
-        if self.result.as_mut().unwrap().is_bin {
-            self.result
-                .as_mut()
-                .unwrap()
-                .writer
-                .write_all(&self.data[..])?;
-            self.data.clear();
-        }
+        self.result
+            .as_mut()
+            .unwrap()
+            .writer
+            .write_all(&self.data[..])?;
+        self.data.clear();
         self.result.as_mut().unwrap().writer.end_packet().await?;
         self.col = 0;
 
@@ -434,8 +525,6 @@ impl<'a, W: AsyncWrite + Unpin + 'a> RowWriter<'a, W> {
     ) -> io::Result<QueryResultWriter<'a, W>> {
         self.finish_inner(extra_info, true).await?;
 
-        // we know that dropping self will see self.finished == true,
-        // and so Drop won't try to use self.result.
         Ok(self.result.take().unwrap())
     }
 
@@ -444,8 +533,9 @@ impl<'a, W: AsyncWrite + Unpin + 'a> RowWriter<'a, W> {
     where
         E: Borrow<[u8]>,
     {
-        self.finish_inner("", false).await?;
-
+        self.finished = true;
+        self.col = 0;
+        self.data.clear();
         self.result.take().unwrap().error(kind, msg).await
     }
 }

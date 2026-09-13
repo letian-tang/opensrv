@@ -40,6 +40,10 @@ mod tls {
     impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for Backend {
         type Error = io::Error;
 
+        async fn authenticate(&self, _: &str, _: &[u8], _: &[u8], _: &[u8]) -> bool {
+            true
+        }
+
         async fn on_prepare<'a>(
             &'a mut self,
             _: &'a str,

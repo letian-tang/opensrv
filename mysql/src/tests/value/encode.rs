@@ -70,6 +70,38 @@ fn mysql_date_values_encode_without_chrono_restrictions() {
     }
 }
 
+#[test]
+fn invalid_numeric_signedness_and_time_range_return_errors() {
+    let signed_tiny = Column {
+        table: String::new(),
+        column: String::new(),
+        collen: 0,
+        coltype: ColumnType::MYSQL_TYPE_TINY,
+        colflags: ColumnFlags::empty(),
+    };
+    assert!(1u8.to_mysql_bin(&mut Vec::new(), &signed_tiny).is_err());
+
+    let unsigned_bigint = Column {
+        coltype: ColumnType::MYSQL_TYPE_LONGLONG,
+        colflags: ColumnFlags::UNSIGNED_FLAG,
+        ..signed_tiny
+    };
+    assert!(1i64
+        .to_mysql_bin(&mut Vec::new(), &unsigned_bigint)
+        .is_err());
+
+    let time_column = Column {
+        coltype: ColumnType::MYSQL_TYPE_TIME,
+        colflags: ColumnFlags::empty(),
+        ..unsigned_bigint
+    };
+    let too_large = time::Duration::from_secs(839 * 3600);
+    assert!(too_large.to_mysql_text(&mut Vec::new()).is_err());
+    assert!(too_large
+        .to_mysql_bin(&mut Vec::new(), &time_column)
+        .is_err());
+}
+
 mod roundtrip_text {
     use super::*;
 

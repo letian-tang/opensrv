@@ -96,10 +96,6 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for Backend {
         "8.0.36-opensrv".to_string()
     }
 
-    fn connect_id(&self) -> u32 {
-        u32::from_le_bytes([0x08, 0x00, 0x00, 0x00])
-    }
-
     fn default_auth_plugin(&self) -> &str {
         MYSQL_NATIVE_PASSWORD
     }
@@ -110,18 +106,6 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for Backend {
         } else {
             MYSQL_NATIVE_PASSWORD
         }
-    }
-
-    fn salt(&self) -> [u8; 20] {
-        let bs = ";X,po_k}>o6^Wz!/kM}N".as_bytes();
-        let mut scramble: [u8; 20] = [0; 20];
-        for i in 0..20 {
-            scramble[i] = bs[i];
-            if scramble[i] == b'\0' || scramble[i] == b'$' {
-                scramble[i] += 1;
-            }
-        }
-        scramble
     }
 }
 

@@ -1404,6 +1404,7 @@ dependencies = [
  "bytes",
  "chrono",
  "futures",
+ "getrandom 0.3.4",
  "mysql",
  "mysql_async",
  "mysql_common 0.32.4",

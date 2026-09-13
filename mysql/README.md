@@ -29,6 +29,11 @@ struct Backend;
 impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for Backend {
     type Error = io::Error;
 
+    // 仅用于这个无认证示例。生产环境必须验证 username、salt 和 auth_data。
+    async fn authenticate(&self, _: &str, _: &[u8], _: &[u8], _: &[u8]) -> bool {
+        true
+    }
+
     async fn on_prepare<'a>(
         &'a mut self,
         _: &'a str,
@@ -89,7 +94,13 @@ cargo run --example serve_one
 
 这两个入口会在协议层外增加连接级读写缓冲，在 JDBC 等真实客户端场景下更稳定。
 
+`IntermediaryOptions` 还可以分别配置读、认证和写超时、最大 packet、单连接 prepared statement 数量，以及单连接累计 long-data 上限。写超时默认 60 秒；生产环境应根据查询结果大小和客户端网络情况显式配置其余资源上限。
+
+如果后端支持连接池复用语义，应覆盖 `on_reset_connection()`：只有在事务、会话变量和其他连接局部状态确实恢复后才返回 `true`。默认返回 `false`，此时 `COM_RESET_CONNECTION` 会收到“不支持”错误，不会被虚假确认。
+
 ## 认证与兼容性
+
+`AsyncMysqlShim` 默认拒绝认证，避免实现者遗漏认证方法后意外开放数据库。只允许可信网络中的无认证服务，也必须像上面的示例一样显式返回 `true`。默认 handshake challenge 每个连接随机生成。
 
 当前支持：
 

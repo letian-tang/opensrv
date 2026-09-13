@@ -148,6 +148,16 @@ impl<'a> ParamParser<'a> {
             Value::parse_from(&mut input, coltype, unsigned)?;
         }
 
+        if !input.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "malformed execute packet: {} trailing parameter bytes",
+                    input.len()
+                ),
+            ));
+        }
+
         Ok(())
     }
 }
@@ -367,6 +377,16 @@ mod tests {
             .collect();
         assert_eq!(i32::try_from(values[0].value).unwrap(), 42);
         assert_eq!(<&str>::try_from(values[1].value).unwrap(), "abc");
+    }
+
+    #[test]
+    fn execute_parameters_reject_trailing_bytes() {
+        let mut stmt = StatementData {
+            params: 1,
+            bound_types: vec![(ColumnType::MYSQL_TYPE_TINY, false)],
+            ..Default::default()
+        };
+        assert!(ParamParser::new(&[0, 0, 42, 99], &mut stmt).is_err());
     }
 
     #[test]

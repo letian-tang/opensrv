@@ -103,10 +103,15 @@ async fn resultset_terminators_follow_capability_matrix() {
                 }];
                 let mut wire = Vec::new();
                 let mut writer = PacketWriter::new(&mut wire);
-                let mut rows = crate::QueryResultWriter::new(&mut writer, binary, caps)
-                    .start(&columns)
-                    .await
-                    .unwrap();
+                let mut rows = crate::QueryResultWriter::new(
+                    &mut writer,
+                    binary,
+                    caps,
+                    crate::StatusFlags::empty(),
+                )
+                .start(&columns)
+                .await
+                .unwrap();
                 rows.write_row([42i32]).await.unwrap();
                 rows.finish().await.unwrap();
                 drop(writer);
@@ -139,6 +144,48 @@ async fn resultset_terminators_follow_capability_matrix() {
             }
         }
     }
+}
+
+#[tokio::test]
+async fn partial_text_row_is_discarded_before_error_packet() {
+    let caps = CapabilityFlags::CLIENT_PROTOCOL_41 | CapabilityFlags::CLIENT_DEPRECATE_EOF;
+    let columns = [
+        crate::Column {
+            table: String::new(),
+            column: "a".into(),
+            collen: 4,
+            coltype: crate::ColumnType::MYSQL_TYPE_LONG,
+            colflags: crate::ColumnFlags::empty(),
+        },
+        crate::Column {
+            table: String::new(),
+            column: "b".into(),
+            collen: 4,
+            coltype: crate::ColumnType::MYSQL_TYPE_LONG,
+            colflags: crate::ColumnFlags::empty(),
+        },
+    ];
+    let mut wire = Vec::new();
+    let mut writer = PacketWriter::new(&mut wire);
+    let mut rows = crate::QueryResultWriter::new(
+        &mut writer,
+        false,
+        caps,
+        crate::StatusFlags::SERVER_STATUS_AUTOCOMMIT,
+    )
+    .start(&columns)
+    .await
+    .unwrap();
+    rows.write_col(42i32).unwrap();
+    rows.finish_error(crate::ErrorKind::ER_UNKNOWN_ERROR, b"failed")
+        .await
+        .unwrap();
+    drop(writer);
+
+    let packets = split_wire_packets(&wire);
+    assert_eq!(packets.len(), 4);
+    assert_eq!(packets[0], [2]);
+    assert_eq!(packets[3][0], 0xff);
 }
 
 async fn capture_ok_payload(info: &str, capabilities: CapabilityFlags, header: u8) -> Vec<u8> {
