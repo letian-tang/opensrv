@@ -447,7 +447,7 @@ async fn auth_switch_uses_saved_scramble_and_preserves_sequence() {
         } else {
             &b"wrong"[..]
         };
-        let scramble = myc::scramble::scramble_sha256(salt, password).unwrap();
+        let scramble = opensrv_mysql::scramble_sha256(salt, password).unwrap();
         write_wire_packet(&mut client, 3, &scramble).await.unwrap();
         let (seq, packet) = timeout(Duration::from_secs(2), read_wire_packet(&mut client))
             .await
@@ -567,7 +567,7 @@ async fn authentication_uses_the_challenge_from_the_greeting() {
     let salt_start = version_end + 5;
     let mut salt = greeting[salt_start..salt_start + 8].to_vec();
     salt.extend_from_slice(&greeting[salt_start + 27..salt_start + 39]);
-    let response = myc::scramble::scramble_sha256(&salt, b"secret").unwrap();
+    let response = opensrv_mysql::scramble_sha256(&salt, b"secret").unwrap();
     write_wire_packet(
         &mut client,
         1,

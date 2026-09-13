@@ -45,6 +45,15 @@ fn empty_password_matches_empty_auth_response() {
 }
 
 #[test]
+fn caching_sha2_rejects_invalid_salt_length() {
+    assert!(!verify_caching_sha2_password(
+        b"secret",
+        b"too-short",
+        &[0; 32]
+    ));
+}
+
+#[test]
 fn generated_scrambles_are_fresh_and_protocol_safe() {
     let first = crate::generate_scramble().unwrap();
     let second = crate::generate_scramble().unwrap();

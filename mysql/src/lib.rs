@@ -37,8 +37,8 @@ use tokio::time::timeout;
 #[cfg(feature = "tls")]
 use tokio_rustls::rustls::ServerConfig;
 
+pub use crate::myc::auth::plugins::mysql_native_password::scramble_native;
 pub use crate::myc::constants::{CapabilityFlags, ColumnFlags, ColumnType, StatusFlags};
-pub use crate::myc::scramble::{scramble_native, scramble_sha256};
 #[cfg(feature = "tls")]
 pub use crate::tls::{plain_run_with_options, secure_run_with_options};
 
@@ -183,6 +183,11 @@ pub fn verify_mysql_native_password(password: &[u8], salt: &[u8], auth_data: &[u
         Some(expected) => auth_data == expected,
         None => auth_data.is_empty(),
     }
+}
+
+pub fn scramble_sha256(nonce: &[u8], password: &[u8]) -> Option<[u8; 32]> {
+    let nonce = <&[u8; 20]>::try_from(nonce).ok()?;
+    myc::auth::plugins::caching_sha2_password::scramble_sha256(nonce, password)
 }
 
 pub fn verify_caching_sha2_password(password: &[u8], salt: &[u8], auth_data: &[u8]) -> bool {
