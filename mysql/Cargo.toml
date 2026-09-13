@@ -34,9 +34,6 @@ mysql = "28"
 mysql_async = "0.36"
 tokio = { version = "1.0", features = ["full"] }
 futures = "0.3"
-rcgen = "0.14"
-tempfile = "3.27.0"
-native-tls = "0.2.8"
 rustls-pemfile = { version = "2.0" }
 rustls-pki-types = "1.0"
 
