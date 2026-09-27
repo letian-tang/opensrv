@@ -44,6 +44,309 @@ fn split_wire_packets(mut wire: &[u8]) -> Vec<Vec<u8>> {
 }
 
 #[tokio::test]
+async fn explicit_metadata_matches_query_and_prepare_wire() {
+    use crate::{
+        Column, ColumnFlags, ColumnMetadata, ColumnType, QueryResultWriter, StatementMetaWriter,
+        StatusFlags,
+    };
+    use std::sync::{atomic::AtomicBool, Arc};
+    let mut c = Column {
+        table: "t".into(),
+        column: "v".into(),
+        collen: 123,
+        coltype: ColumnType::MYSQL_TYPE_VAR_STRING,
+        colflags: ColumnFlags::BINARY_FLAG,
+    };
+    let cols = vec![
+        c.clone(),
+        {
+            c.coltype = ColumnType::MYSQL_TYPE_BLOB;
+            c.clone()
+        },
+        {
+            c.coltype = ColumnType::MYSQL_TYPE_NEWDECIMAL;
+            c
+        },
+    ];
+    let metadata = [
+        ColumnMetadata {
+            collation: Some(46),
+            decimals: 0,
+        },
+        ColumnMetadata {
+            collation: Some(45),
+            decimals: 0,
+        },
+        ColumnMetadata {
+            collation: Some(63),
+            decimals: 2,
+        },
+    ];
+    for deprecate in [false, true] {
+        let mut caps = CapabilityFlags::CLIENT_PROTOCOL_41;
+        caps.set(CapabilityFlags::CLIENT_DEPRECATE_EOF, deprecate);
+        let mut query_wire = Vec::new();
+        let mut w = PacketWriter::new(&mut query_wire);
+        QueryResultWriter::new(&mut w, false, caps, StatusFlags::SERVER_STATUS_IN_TRANS)
+            .start_with_metadata(&cols, &metadata)
+            .await
+            .unwrap()
+            .finish()
+            .await
+            .unwrap();
+        drop(w);
+        let query_packets = split_wire_packets(&query_wire);
+        for (packet, expected) in query_packets[1..4].iter().zip(metadata) {
+            let mut pos = 0;
+            for _ in 0..6 {
+                pos += 1 + packet[pos] as usize;
+            }
+            assert_eq!(packet[pos], 12);
+            assert_eq!(
+                u16::from_le_bytes([packet[pos + 1], packet[pos + 2]]),
+                expected.collation.unwrap()
+            );
+            assert_eq!(
+                u32::from_le_bytes(packet[pos + 3..pos + 7].try_into().unwrap()),
+                123
+            );
+            assert_eq!(packet[pos + 10], expected.decimals);
+        }
+        let mut prepare_wire = Vec::new();
+        let mut w = PacketWriter::new(&mut prepare_wire);
+        let mut stmts = std::collections::HashMap::new();
+        StatementMetaWriter {
+            writer: &mut w,
+            stmts: &mut stmts,
+            client_capabilities: caps,
+            status_flags: StatusFlags::SERVER_STATUS_IN_TRANS,
+            completion: Arc::new(AtomicBool::new(false)),
+        }
+        .reply_with_metadata(1, &cols, &cols, &metadata, &metadata)
+        .await
+        .unwrap();
+        drop(w);
+        let prepare_packets = split_wire_packets(&prepare_wire);
+        assert_eq!(prepare_packets[1..4], query_packets[1..4]);
+        let start = if deprecate { 4 } else { 5 };
+        assert_eq!(prepare_packets[start..start + 3], query_packets[1..4]);
+        if !deprecate {
+            assert_eq!(prepare_packets[4], vec![0xfe, 0, 0, 1, 0]);
+            assert_eq!(prepare_packets[8], prepare_packets[4]);
+        }
+    }
+}
+
+#[tokio::test]
+async fn invalid_metadata_is_rejected_before_any_response() {
+    use crate::{
+        Column, ColumnFlags, ColumnMetadata, ColumnType, QueryResultWriter, StatementMetaWriter,
+        StatusFlags,
+    };
+    use std::sync::{atomic::AtomicBool, Arc};
+    let cols = [Column {
+        table: String::new(),
+        column: "v".into(),
+        collen: 0,
+        coltype: ColumnType::MYSQL_TYPE_VAR_STRING,
+        colflags: ColumnFlags::empty(),
+    }];
+    for metadata in [
+        vec![],
+        vec![ColumnMetadata {
+            collation: Some(8),
+            decimals: 0,
+        }],
+        vec![ColumnMetadata {
+            collation: Some(0),
+            decimals: 0,
+        }],
+        vec![ColumnMetadata {
+            collation: Some(65535),
+            decimals: 0,
+        }],
+        vec![ColumnMetadata {
+            collation: Some(45),
+            decimals: 32,
+        }],
+    ] {
+        let mut wire = Vec::new();
+        let mut w = PacketWriter::new(&mut wire);
+        let caps = CapabilityFlags::CLIENT_PROTOCOL_41;
+        let error = QueryResultWriter::new(&mut w, false, caps, StatusFlags::empty())
+            .start_with_metadata(&cols, &metadata)
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        let mut stmts = std::collections::HashMap::new();
+        for bad_params in [false, true] {
+            let meta = StatementMetaWriter {
+                writer: &mut w,
+                stmts: &mut stmts,
+                client_capabilities: caps,
+                status_flags: StatusFlags::empty(),
+                completion: Arc::new(AtomicBool::new(false)),
+            };
+            let error = if bad_params {
+                meta.reply_with_metadata(1, &cols, &[], &metadata, &[])
+                    .await
+            } else {
+                meta.reply_with_metadata(1, &[], &cols, &[], &metadata)
+                    .await
+            }
+            .unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        }
+        assert!(stmts.is_empty());
+        drop(w);
+        assert!(wire.is_empty());
+    }
+    // Upper UTF-8 collation IDs are legal in column metadata (u16), even though
+    // the client's handshake can only express IDs up to 255.
+    ColumnMetadata {
+        collation: Some(309),
+        decimals: 31,
+    }
+    .validate()
+    .unwrap();
+}
+
+#[tokio::test]
+async fn explicit_zero_and_result_local_flags_survive_multiple_results() {
+    use crate::{QueryResultWriter, StatusFlags};
+    for deprecate in [false, true] {
+        let mut caps = CapabilityFlags::CLIENT_PROTOCOL_41 | CapabilityFlags::CLIENT_MULTI_RESULTS;
+        caps.set(CapabilityFlags::CLIENT_DEPRECATE_EOF, deprecate);
+        let mut wire = Vec::new();
+        let mut w = PacketWriter::new(&mut wire);
+        let mut status = StatusFlags::SERVER_STATUS_AUTOCOMMIT;
+        let (results, _) = QueryResultWriter::new_tracked(&mut w, false, caps, &mut status);
+        let results = results
+            .complete_one_with_status(OkResponse {
+                status_flags: StatusFlags::SERVER_STATUS_IN_TRANS
+                    | StatusFlags::SERVER_STATUS_NO_INDEX_USED,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let results = results.complete_one(OkResponse::default()).await.unwrap();
+        results
+            .completed_with_status(OkResponse::default())
+            .await
+            .unwrap();
+        drop(w);
+        assert!(status.is_empty());
+        let packets = split_wire_packets(&wire);
+        let flags: Vec<_> = packets
+            .iter()
+            .map(|p| u16::from_le_bytes([p[3], p[4]]))
+            .collect();
+        assert_eq!(
+            flags,
+            vec![
+                (StatusFlags::SERVER_STATUS_IN_TRANS
+                    | StatusFlags::SERVER_STATUS_NO_INDEX_USED
+                    | StatusFlags::SERVER_MORE_RESULTS_EXISTS)
+                    .bits(),
+                (StatusFlags::SERVER_STATUS_IN_TRANS | StatusFlags::SERVER_MORE_RESULTS_EXISTS)
+                    .bits(),
+                0
+            ]
+        );
+    }
+}
+
+#[tokio::test]
+async fn multiple_results_gate_capabilities_and_end_errors_without_extra_eof() {
+    use crate::{Column, ColumnFlags, ColumnType, ErrorKind, QueryResultWriter, StatusFlags};
+    use std::sync::atomic::Ordering;
+    let columns = [Column {
+        table: String::new(),
+        column: "v".into(),
+        collen: 0,
+        coltype: ColumnType::MYSQL_TYPE_VAR_STRING,
+        colflags: ColumnFlags::empty(),
+    }];
+    for binary in [false, true] {
+        for deprecate in [false, true] {
+            for negotiated in [false, true] {
+                let mut caps = CapabilityFlags::CLIENT_PROTOCOL_41;
+                caps.set(CapabilityFlags::CLIENT_DEPRECATE_EOF, deprecate);
+                // Negotiating only the other command's capability is insufficient.
+                caps |= if binary == negotiated {
+                    CapabilityFlags::CLIENT_PS_MULTI_RESULTS
+                } else {
+                    CapabilityFlags::CLIENT_MULTI_RESULTS
+                };
+                let mut wire = Vec::new();
+                let mut writer = PacketWriter::new(&mut wire);
+                writer.set_max_packet_size(64);
+                let trans = StatusFlags::SERVER_STATUS_IN_TRANS;
+                let mut status = trans;
+                let (results, completed) =
+                    QueryResultWriter::new_tracked(&mut writer, binary, caps, &mut status);
+                let mut rows = results.start(&columns).await.unwrap();
+                rows.write_row(["ok"]).await.unwrap();
+                let results = rows.finish_one().await.unwrap();
+                let second = results.start(&columns).await;
+                if negotiated {
+                    let mut rows = second.unwrap();
+                    // A row limit violation is recoverable before that row's
+                    // bytes reach the transport. No partial row/EOF may precede ERR.
+                    assert!(rows.write_col("x".repeat(65)).is_err());
+                    rows.set_status_flags(StatusFlags::empty()); // backend rolled back
+                    rows.finish_error(ErrorKind::ER_NET_PACKET_TOO_LARGE, b"large")
+                        .await
+                        .unwrap();
+                } else {
+                    assert_eq!(
+                        second.err().unwrap().kind(),
+                        std::io::ErrorKind::InvalidInput
+                    );
+                }
+                assert_eq!(completed.load(Ordering::Acquire), negotiated);
+                drop(writer);
+                assert_eq!(
+                    status,
+                    if negotiated {
+                        StatusFlags::empty()
+                    } else {
+                        trans
+                    }
+                );
+                let packets = split_wire_packets(&wire);
+                let first_row = if deprecate { 2 } else { 3 };
+                let expected_row = if binary {
+                    &b"\0\0\x02ok"[..]
+                } else {
+                    &b"\x02ok"[..]
+                };
+                assert_eq!(packets[first_row], expected_row);
+                if negotiated {
+                    let end = &packets[first_row + 1];
+                    assert_eq!(end[0], 0xfe);
+                    assert_eq!(
+                        u16::from_le_bytes([end[3], end[4]]),
+                        (trans | StatusFlags::SERVER_MORE_RESULTS_EXISTS).bits()
+                    );
+                    assert_eq!(packets[first_row + 2], [1]); // second result header
+                    let last = packets.last().unwrap();
+                    assert_eq!(last[0], 0xff);
+                    assert_eq!(
+                        u16::from_le_bytes([last[1], last[2]]),
+                        ErrorKind::ER_NET_PACKET_TOO_LARGE as u16
+                    );
+                    assert_eq!(packets.len(), if deprecate { 7 } else { 9 });
+                } else {
+                    assert_eq!(packets.len(), first_row + 1); // no false success terminator
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
 async fn ok_session_state_requires_both_capability_and_status() {
     for session_track in [false, true] {
         for deprecate_eof in [false, true] {

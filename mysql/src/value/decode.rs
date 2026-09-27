@@ -45,6 +45,9 @@ pub enum ValueInner<'a> {
     /// A [binary
     /// encoding](https://mariadb.com/kb/en/library/resultset-row/#timestamp-binary-encoding) of a
     /// `MYSQL_TYPE_TIMESTAMP` or `MYSQL_TYPE_DATETIME`.
+    /// A 13-byte input additionally carries MySQL 8's signed, little-endian
+    /// time-zone offset in minutes. It is preserved here, not silently discarded
+    /// by conversion to a timezone-free `NaiveDateTime`.
     Datetime(&'a [u8]),
 }
 
@@ -83,15 +86,16 @@ impl<'a> Value<'a> {
 
 macro_rules! read_bytes {
     ($input:expr, $len:expr) => {
-        if $len as usize > $input.len() {
-            Err(io::Error::new(
+        match usize::try_from($len) {
+            Ok(len) if len <= $input.len() => {
+                let (bits, rest) = $input.split_at(len);
+                *$input = rest;
+                Ok(bits)
+            }
+            _ => Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
                 "EOF while reading length-encoded string",
-            ))
-        } else {
-            let (bits, rest) = $input.split_at($len as usize);
-            *$input = rest;
-            Ok(bits)
+            )),
         }
     };
 }
@@ -159,18 +163,13 @@ impl<'a> ValueInner<'a> {
             ColumnType::MYSQL_TYPE_DOUBLE => {
                 Ok(ValueInner::Double(input.read_f64::<LittleEndian>()?))
             }
-            ColumnType::MYSQL_TYPE_TIMESTAMP | ColumnType::MYSQL_TYPE_DATETIME => {
-                let len = input.read_u8()?;
-                Ok(ValueInner::Datetime(read_bytes!(input, len)?))
-            }
+            ColumnType::MYSQL_TYPE_TIMESTAMP | ColumnType::MYSQL_TYPE_DATETIME => Ok(
+                ValueInner::Datetime(read_temporal(input, &[0, 4, 7, 11, 13])?),
+            ),
             ColumnType::MYSQL_TYPE_DATE => {
-                let len = input.read_u8()?;
-                Ok(ValueInner::Date(read_bytes!(input, len)?))
+                Ok(ValueInner::Date(read_temporal(input, &[0, 4, 7, 11])?))
             }
-            ColumnType::MYSQL_TYPE_TIME => {
-                let len = input.read_u8()?;
-                Ok(ValueInner::Time(read_bytes!(input, len)?))
-            }
+            ColumnType::MYSQL_TYPE_TIME => Ok(ValueInner::Time(read_temporal(input, &[0, 8, 12])?)),
             ColumnType::MYSQL_TYPE_NULL => Ok(ValueInner::NULL),
             ct => Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -178,6 +177,17 @@ impl<'a> ValueInner<'a> {
             )),
         }
     }
+}
+
+fn read_temporal<'a>(input: &mut &'a [u8], lengths: &[u8]) -> io::Result<&'a [u8]> {
+    let len = input.read_u8()?;
+    if !lengths.contains(&len) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("invalid binary temporal length {len}"),
+        ));
+    }
+    read_bytes!(input, len)
 }
 
 // NOTE: these are now TryFrom to avoid panics on invalid data
@@ -336,8 +346,7 @@ pub fn to_naive_datetime(val: Value) -> Result<NaiveDateTime, io::Error> {
 
                 // unwrap safety: guarded by `v.len()` check
                 let us = v.read_u32::<LittleEndian>().unwrap();
-
-                x.and_hms_micro_opt(h, m, s, us)
+                if us >= 1_000_000 { None } else { x.and_hms_micro_opt(h, m, s, us) }
             })
         }
         _ => {

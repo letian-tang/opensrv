@@ -19,6 +19,98 @@ use crate::myc::constants::{CapabilityFlags, Command as CommandByte, UTF8_GENERA
 use crate::packet_reader::PacketReader;
 
 #[test]
+fn handshake_lenenc_auth_accepts_all_integer_widths_and_rejects_truncation() {
+    let caps = CapabilityFlags::CLIENT_PROTOCOL_41
+        | CapabilityFlags::CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA
+        | CapabilityFlags::CLIENT_PLUGIN_AUTH
+        | CapabilityFlags::CLIENT_CONNECT_WITH_DB;
+    for prefix in [
+        vec![3],
+        vec![0xfc, 3, 0],
+        vec![0xfd, 3, 0, 0],
+        vec![0xfe, 3, 0, 0, 0, 0, 0, 0, 0],
+    ] {
+        let mut payload = vec![0; 32];
+        payload[..4].copy_from_slice(&caps.bits().to_le_bytes());
+        payload[8] = 45;
+        payload.extend_from_slice(b"user\0");
+        payload.extend_from_slice(&prefix);
+        payload.extend_from_slice(b"abcdb\0mysql_native_password\0");
+        for after_tls in [false, true] {
+            for end in 0..payload.len() {
+                assert!(client_handshake(&payload[..end], after_tls).is_err());
+            }
+            let (_, hs) = client_handshake(&payload, after_tls).unwrap();
+            assert_eq!(hs.auth_response, b"abc");
+            assert_eq!(hs.db.unwrap(), b"db");
+        }
+    }
+}
+
+#[test]
+fn handshake_lenenc_auth_rejects_null_and_invalid_markers() {
+    let caps = CapabilityFlags::CLIENT_PROTOCOL_41
+        | CapabilityFlags::CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA;
+    for after_tls in [false, true] {
+        for marker in [0xfb, 0xff] {
+            let mut payload = vec![0; 32];
+            payload[..4].copy_from_slice(&caps.bits().to_le_bytes());
+            payload[8] = 45;
+            payload.extend_from_slice(b"user\0");
+            payload.push(marker);
+            // An invalid marker must not become empty authentication or length 255.
+            if marker == 0xff {
+                payload.extend_from_slice(&[0; 255]);
+            }
+            assert!(client_handshake(&payload, after_tls).is_err());
+        }
+    }
+}
+
+#[test]
+fn handshake_required_fields_and_empty_strings() {
+    for db in [false, true] {
+        for plugin in [false, true] {
+            for empty in [false, true] {
+                let mut caps =
+                    CapabilityFlags::CLIENT_PROTOCOL_41 | CapabilityFlags::CLIENT_SECURE_CONNECTION;
+                caps.set(CapabilityFlags::CLIENT_CONNECT_WITH_DB, db);
+                caps.set(CapabilityFlags::CLIENT_PLUGIN_AUTH, plugin);
+                let mut payload = vec![0; 32];
+                payload[..4].copy_from_slice(&caps.bits().to_le_bytes());
+                payload[8] = 45;
+                payload.extend_from_slice(b"user\0\x03abc");
+                if db {
+                    payload.extend_from_slice(if empty { b"\0" } else { b"db\0" });
+                }
+                if plugin {
+                    payload.extend_from_slice(if empty {
+                        b"\0"
+                    } else {
+                        b"mysql_native_password\0"
+                    });
+                }
+                for after_tls in [false, true] {
+                    for end in 0..payload.len() {
+                        assert!(
+                            client_handshake(&payload[..end], after_tls).is_err(),
+                            "accepted prefix {end}"
+                        );
+                    }
+                    assert!(client_handshake(&payload, after_tls).is_ok());
+                    let mut trailing = payload.clone();
+                    trailing.extend_from_slice(b"extension");
+                    assert_eq!(
+                        client_handshake(&trailing, after_tls).unwrap().0,
+                        b"extension"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn it_parses_handshake() {
     let data = &[
         0x5b, 0x00, 0x00, 0x01, 0x8d, 0xa6, 0xff, 0x09, 0x00, 0x00, 0x00, 0x01, 0x21, 0x00, 0x00,

@@ -15,7 +15,7 @@
 use std::borrow::Borrow;
 use std::collections::HashMap;
 use std::io::{self, Write};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::Arc;
 
 use mysql_common::constants::{CapabilityFlags, ColumnFlags, StatusFlags};
@@ -23,30 +23,59 @@ use tokio::io::AsyncWrite;
 
 use crate::packet_writer::PacketWriter;
 use crate::value::ToMysqlValue;
-use crate::{writers, OkResponse};
-use crate::{Column, ErrorKind, StatementData};
+use crate::{session_status_flags, writers, ColumnMetadata, OkResponse};
+use crate::{Column, ErrorKind, InitResponse, StatementData};
+
+fn default_column_metadata(column: &Column) -> (&Column, ColumnMetadata) {
+    (column, ColumnMetadata::default())
+}
 
 /// Convenience type for responding to a client `USE <db>` command.
 pub struct InitWriter<'a, W> {
     pub(crate) client_capabilities: CapabilityFlags,
-    pub(crate) status_flags: StatusFlags,
+    pub(crate) status_flags: &'a mut StatusFlags,
     pub(crate) writer: &'a mut PacketWriter<W>,
-    pub(crate) completion: Arc<AtomicBool>,
+    pub(crate) completion: Arc<AtomicU8>,
 }
 
 impl<'a, W: 'a + AsyncWrite + Unpin> InitWriter<'a, W> {
+    pub(crate) fn new_tracked(
+        writer: &'a mut PacketWriter<W>,
+        client_capabilities: CapabilityFlags,
+        status_flags: &'a mut StatusFlags,
+    ) -> (Self, Arc<AtomicU8>) {
+        let completion = Arc::new(AtomicU8::new(InitResponse::Pending as u8));
+        (
+            Self {
+                client_capabilities,
+                status_flags,
+                writer,
+                completion: Arc::clone(&completion),
+            },
+            completion,
+        )
+    }
+
     /// Tell client that database context has been changed
     pub async fn ok(self) -> io::Result<()> {
+        let status = *self.status_flags;
+        self.ok_with_status(status).await
+    }
+
+    /// Complete initialization with explicit session state, including zero.
+    pub async fn ok_with_status(self, status: StatusFlags) -> io::Result<()> {
         writers::write_ok_packet(
             self.writer,
             self.client_capabilities,
             OkResponse {
-                status_flags: self.status_flags,
+                status_flags: status,
                 ..Default::default()
             },
         )
         .await?;
-        self.completion.store(true, Ordering::Release);
+        *self.status_flags = session_status_flags(status);
+        self.completion
+            .store(InitResponse::Ok as u8, Ordering::Release);
         Ok(())
     }
 
@@ -59,7 +88,8 @@ impl<'a, W: 'a + AsyncWrite + Unpin> InitWriter<'a, W> {
         E: Borrow<[u8]> + ?Sized,
     {
         writers::write_err(kind, msg.borrow(), self.writer).await?;
-        self.completion.store(true, Ordering::Release);
+        self.completion
+            .store(InitResponse::Error as u8, Ordering::Release);
         Ok(())
     }
 }
@@ -74,6 +104,7 @@ pub struct StatementMetaWriter<'a, W> {
     pub(crate) writer: &'a mut PacketWriter<W>,
     pub(crate) stmts: &'a mut HashMap<u32, StatementData>,
     pub(crate) client_capabilities: CapabilityFlags,
+    pub(crate) status_flags: StatusFlags,
     pub(crate) completion: Arc<AtomicBool>,
 }
 
@@ -92,14 +123,44 @@ impl<'a, W: AsyncWrite + Unpin + 'a> StatementMetaWriter<'a, W> {
         <PI as IntoIterator>::IntoIter: ExactSizeIterator,
         <CI as IntoIterator>::IntoIter: ExactSizeIterator,
     {
-        let params = params.into_iter();
+        let default_metadata = default_column_metadata as fn(&Column) -> (&Column, ColumnMetadata);
+        let params = params.into_iter().map(default_metadata);
+        let columns = columns.into_iter().map(default_metadata);
+        self.reply_inner(id, params, columns).await
+    }
+
+    /// Reply with explicit collation and decimals for parameters and result columns.
+    /// Each metadata slice must have exactly one entry per corresponding column.
+    pub async fn reply_with_metadata(
+        self,
+        id: u32,
+        params: &[Column],
+        columns: &[Column],
+        param_metadata: &[ColumnMetadata],
+        column_metadata: &[ColumnMetadata],
+    ) -> io::Result<()> {
+        validate_metadata(params, param_metadata)?;
+        validate_metadata(columns, column_metadata)?;
+        self.reply_inner(
+            id,
+            params.iter().zip(param_metadata.iter().copied()),
+            columns.iter().zip(column_metadata.iter().copied()),
+        )
+        .await
+    }
+
+    async fn reply_inner<'c>(
+        self,
+        id: u32,
+        params: impl ExactSizeIterator<Item = (&'c Column, ColumnMetadata)>,
+        columns: impl ExactSizeIterator<Item = (&'c Column, ColumnMetadata)>,
+    ) -> io::Result<()> {
         let param_count = u16::try_from(params.len()).map_err(|_| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "prepared statement has more than 65535 parameters",
             )
         })?;
-        let columns = columns.into_iter();
         u16::try_from(columns.len()).map_err(|_| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -112,8 +173,15 @@ impl<'a, W: AsyncWrite + Unpin + 'a> StatementMetaWriter<'a, W> {
                 format!("duplicate prepared statement id {id}"),
             ));
         }
-        writers::write_prepare_ok(id, params, columns, self.writer, self.client_capabilities)
-            .await?;
+        writers::write_prepare_ok(
+            id,
+            params,
+            columns,
+            self.writer,
+            self.client_capabilities,
+            self.status_flags,
+        )
+        .await?;
         self.stmts.insert(
             id,
             StatementData {
@@ -138,7 +206,20 @@ impl<'a, W: AsyncWrite + Unpin + 'a> StatementMetaWriter<'a, W> {
 
 enum Finalizer {
     Ok(OkResponse),
-    Eof,
+    Eof(StatusFlags),
+}
+
+fn validate_metadata(columns: &[Column], metadata: &[ColumnMetadata]) -> io::Result<()> {
+    if columns.len() != metadata.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "column metadata count mismatch",
+        ));
+    }
+    for metadata in metadata {
+        metadata.validate()?;
+    }
+    Ok(())
 }
 
 /// Convenience type for providing query results to clients.
@@ -163,6 +244,7 @@ pub struct QueryResultWriter<'a, W> {
     pub(crate) writer: &'a mut PacketWriter<W>,
     last_end: Option<Finalizer>,
     default_status_flags: StatusFlags,
+    session_status: Option<&'a mut StatusFlags>,
     completion: Option<Arc<AtomicBool>>,
 }
 
@@ -180,6 +262,7 @@ impl<'a, W: AsyncWrite + Unpin> QueryResultWriter<'a, W> {
             writer,
             last_end: None,
             default_status_flags,
+            session_status: None,
             completion: None,
         }
     }
@@ -188,7 +271,7 @@ impl<'a, W: AsyncWrite + Unpin> QueryResultWriter<'a, W> {
         writer: &'a mut PacketWriter<W>,
         is_bin: bool,
         client_capabilities: CapabilityFlags,
-        default_status_flags: StatusFlags,
+        session_status: &'a mut StatusFlags,
     ) -> (Self, Arc<AtomicBool>) {
         let completion = Arc::new(AtomicBool::new(false));
         (
@@ -197,7 +280,8 @@ impl<'a, W: AsyncWrite + Unpin> QueryResultWriter<'a, W> {
                 client_capabilities,
                 writer,
                 last_end: None,
-                default_status_flags,
+                default_status_flags: *session_status,
+                session_status: Some(session_status),
                 completion: Some(Arc::clone(&completion)),
             },
             completion,
@@ -219,25 +303,35 @@ impl<'a, W: AsyncWrite + Unpin> QueryResultWriter<'a, W> {
             }
         }
 
-        let mut status = self.default_status_flags;
-        if more_exists {
-            status.set(StatusFlags::SERVER_MORE_RESULTS_EXISTS, true);
-        }
-        match self.last_end.take() {
-            None => Ok(()),
+        let status = match self.last_end.take() {
+            None => return Ok(()),
             Some(Finalizer::Ok(mut ok_packet)) => {
-                if ok_packet.status_flags.is_empty() {
-                    ok_packet.status_flags = self.default_status_flags;
-                }
-                if more_exists {
-                    ok_packet
-                        .status_flags
-                        .set(StatusFlags::SERVER_MORE_RESULTS_EXISTS, true);
-                }
-                writers::write_ok_packet(self.writer, self.client_capabilities, ok_packet).await
+                ok_packet
+                    .status_flags
+                    .set(StatusFlags::SERVER_MORE_RESULTS_EXISTS, more_exists);
+                let status = ok_packet.status_flags;
+                writers::write_ok_packet(self.writer, self.client_capabilities, ok_packet).await?;
+                status
             }
-            Some(Finalizer::Eof) => writers::write_eof_packet(self.writer, status).await,
+            Some(Finalizer::Eof(mut status)) => {
+                status.set(StatusFlags::SERVER_MORE_RESULTS_EXISTS, more_exists);
+                writers::write_eof_packet(self.writer, status).await?;
+                status
+            }
+        };
+        if let Some(session_status) = &mut self.session_status {
+            **session_status = session_status_flags(status);
         }
+        Ok(())
+    }
+
+    /// Set the status of the next resultset, including an explicit zero.
+    /// Completing the response carries durable flags (transaction/autocommit/SQL mode)
+    /// into subsequent commands. An ERR packet cannot report status on the wire,
+    /// but `error` also saves it for subsequent responses (e.g. after rollback).
+    /// opensrv does not infer transaction state from SQL.
+    pub fn set_status_flags(&mut self, status: StatusFlags) {
+        self.default_status_flags = status;
     }
 
     /// Start a resultset response to the client that conforms to the given `columns`.
@@ -247,17 +341,42 @@ impl<'a, W: AsyncWrite + Unpin> QueryResultWriter<'a, W> {
     /// See [`RowWriter`](struct.RowWriter.html).
     pub async fn start(mut self, columns: &'a [Column]) -> io::Result<RowWriter<'a, W>> {
         self.finalize(true).await?;
-        RowWriter::new(self, columns).await
+        RowWriter::new(self, columns, None).await
+    }
+
+    /// Start a resultset with one explicit metadata entry per column.
+    /// The metadata changes only the wire description, not row value encoding.
+    pub async fn start_with_metadata(
+        mut self,
+        columns: &'a [Column],
+        metadata: &[ColumnMetadata],
+    ) -> io::Result<RowWriter<'a, W>> {
+        validate_metadata(columns, metadata)?;
+        self.finalize(true).await?;
+        RowWriter::new(self, columns, Some(metadata)).await
     }
 
     /// Send an empty resultset response to the client indicating that `rows` rows were affected by
     /// the query in this resultset. `last_insert_id` may be given to communiate an identifier for
     /// a client's most recent insertion.
     pub async fn complete_one(
+        self,
+        mut ok_packet: OkResponse,
+    ) -> io::Result<QueryResultWriter<'a, W>> {
+        // Compatibility: existing callers commonly pass OkResponse::default().
+        if ok_packet.status_flags.is_empty() {
+            ok_packet.status_flags = self.default_status_flags;
+        }
+        self.complete_one_with_status(ok_packet).await
+    }
+
+    /// Like `complete_one`, but treats `status_flags` literally, including zero.
+    pub async fn complete_one_with_status(
         mut self,
         ok_packet: OkResponse,
     ) -> io::Result<QueryResultWriter<'a, W>> {
         self.finalize(true).await?;
+        self.default_status_flags = session_status_flags(ok_packet.status_flags);
         self.last_end = Some(Finalizer::Ok(ok_packet));
         Ok(self)
     }
@@ -269,6 +388,14 @@ impl<'a, W: AsyncWrite + Unpin> QueryResultWriter<'a, W> {
         self.complete_one(ok_packet).await?.no_more_results().await
     }
 
+    /// Complete a command with explicit status flags; zero is a valid value.
+    pub async fn completed_with_status(self, ok_packet: OkResponse) -> io::Result<()> {
+        self.complete_one_with_status(ok_packet)
+            .await?
+            .no_more_results()
+            .await
+    }
+
     /// Reply to the client's query with an error.
     pub async fn error<E>(mut self, kind: ErrorKind, msg: &E) -> io::Result<()>
     where
@@ -276,6 +403,9 @@ impl<'a, W: AsyncWrite + Unpin> QueryResultWriter<'a, W> {
     {
         self.finalize(true).await?;
         writers::write_err(kind, msg.borrow(), self.writer).await?;
+        if let Some(session_status) = &mut self.session_status {
+            **session_status = session_status_flags(self.default_status_flags);
+        }
         if let Some(completion) = &self.completion {
             completion.store(true, Ordering::Release);
         }
@@ -284,7 +414,15 @@ impl<'a, W: AsyncWrite + Unpin> QueryResultWriter<'a, W> {
 
     /// Send the last bits of the last resultset to the client, and indicate that there are no more
     /// resultsets coming.
+    /// At least one result must have been started/completed. To return an empty
+    /// OK response, use `completed(OkResponse::default())` instead.
     pub async fn no_more_results(mut self) -> io::Result<()> {
+        if self.last_end.is_none() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "cannot finish a command without a result or OK response",
+            ));
+        }
         self.finalize(false).await?;
         if let Some(completion) = &self.completion {
             completion.store(true, Ordering::Release);
@@ -317,6 +455,36 @@ pub struct RowWriter<'a, W: AsyncWrite + Unpin> {
     finished: bool,
 }
 
+struct RowBufferWriter<'a> {
+    buffer: &'a mut Vec<u8>,
+    limit: usize,
+}
+
+impl Write for RowBufferWriter<'_> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let new_len = self
+            .buffer
+            .len()
+            .checked_add(buf.len())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "row size overflow"))?;
+        if new_len > self.limit {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "outgoing MySQL packet exceeds configured limit: {} bytes > {} bytes",
+                    new_len, self.limit
+                ),
+            ));
+        }
+        self.buffer.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
 impl<'a, W> RowWriter<'a, W>
 where
     W: 'a + AsyncWrite + Unpin,
@@ -324,6 +492,7 @@ where
     async fn new(
         result: QueryResultWriter<'a, W>,
         columns: &'a [Column],
+        metadata: Option<&[ColumnMetadata]>,
     ) -> io::Result<RowWriter<'a, W>> {
         let bitmap_len = (columns.len() + 7 + 2) / 8;
         let client_capabilities = result.client_capabilities;
@@ -338,19 +507,33 @@ where
 
             finished: false,
         };
-        rw.start().await?;
+        rw.start(metadata).await?;
         Ok(rw)
     }
 
     #[inline]
-    async fn start(&mut self) -> io::Result<()> {
+    async fn start(&mut self, metadata: Option<&[ColumnMetadata]>) -> io::Result<()> {
         if !self.columns.is_empty() {
-            writers::column_definitions(
-                self.columns,
-                self.result.as_mut().unwrap().writer,
-                self.client_capabilities,
-            )
-            .await?;
+            let result = self.result.as_mut().unwrap();
+            if let Some(metadata) = metadata {
+                writers::column_definitions(
+                    self.columns.iter().zip(metadata.iter().copied()),
+                    result.writer,
+                    self.client_capabilities,
+                    result.default_status_flags,
+                )
+                .await?;
+            } else {
+                let default_metadata =
+                    default_column_metadata as fn(&Column) -> (&Column, ColumnMetadata);
+                writers::column_definitions(
+                    self.columns.iter().map(default_metadata),
+                    result.writer,
+                    self.client_capabilities,
+                    result.default_status_flags,
+                )
+                .await?;
+            }
         }
 
         Ok(())
@@ -375,20 +558,34 @@ where
             return Ok(());
         }
 
-        if self.result.as_mut().unwrap().is_bin {
+        let c = self.columns.get(self.col).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "row has more columns than specification",
+            )
+        })?;
+        let checkpoint = self.data.len();
+        let packet_capacity = self
+            .result
+            .as_ref()
+            .unwrap()
+            .writer
+            .remaining_packet_capacity();
+        let result = if self.result.as_mut().unwrap().is_bin {
             if self.col == 0 {
-                self.data.push(0x00);
-
-                // leave space for nullmap
-                self.data.resize(1 + self.bitmap_len, 0);
+                let header_len = 1 + self.bitmap_len;
+                if header_len > packet_capacity {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "outgoing MySQL packet exceeds configured limit: {} bytes > {} bytes",
+                            header_len, packet_capacity
+                        ),
+                    ));
+                }
+                self.data.resize(header_len, 0);
             }
 
-            let c = self.columns.get(self.col).ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "row has more columns than specification",
-                )
-            })?;
             if v.is_null() {
                 if c.colflags.contains(ColumnFlags::NOT_NULL_FLAG) {
                     return Err(io::Error::new(
@@ -401,15 +598,28 @@ where
                     // NULL-bitmap-bit  = ((field-pos + offset) % 8)
                     self.data[1 + (self.col + 2) / 8] |= 1u8 << ((self.col + 2) % 8);
                 }
+                Ok(())
             } else {
-                let mut encoded = Vec::new();
-                v.to_mysql_bin(&mut encoded, c)?;
-                self.data.extend_from_slice(&encoded);
+                v.to_mysql_bin(
+                    &mut RowBufferWriter {
+                        buffer: &mut self.data,
+                        limit: packet_capacity,
+                    },
+                    c,
+                )
             }
         } else {
-            let mut encoded = Vec::new();
-            v.to_mysql_text(&mut encoded)?;
-            self.data.extend_from_slice(&encoded);
+            v.to_mysql_text_with_column(
+                &mut RowBufferWriter {
+                    buffer: &mut self.data,
+                    limit: packet_capacity,
+                },
+                c,
+            )
+        };
+        if let Err(error) = result {
+            self.data.truncate(checkpoint);
+            return Err(error);
         }
         self.col += 1;
         Ok(())
@@ -433,9 +643,9 @@ where
             .as_mut()
             .unwrap()
             .writer
-            .write_all(&self.data[..])?;
+            .write_packet(&self.data)
+            .await?;
         self.data.clear();
-        self.result.as_mut().unwrap().writer.end_packet().await?;
         self.col = 0;
 
         Ok(())
@@ -462,6 +672,11 @@ where
 }
 
 impl<'a, W: AsyncWrite + Unpin + 'a> RowWriter<'a, W> {
+    /// Set the status sent with this resultset's final EOF/OK packet.
+    pub fn set_status_flags(&mut self, status: StatusFlags) {
+        self.result.as_mut().unwrap().set_status_flags(status);
+    }
+
     async fn finish_inner(&mut self, extra_info: &str, complete: bool) -> io::Result<()> {
         if self.finished {
             return Ok(());
@@ -474,9 +689,11 @@ impl<'a, W: AsyncWrite + Unpin + 'a> RowWriter<'a, W> {
         }
 
         if complete {
+            let status = self.result.as_ref().unwrap().default_status_flags;
             if self.columns.is_empty() {
                 let resp = OkResponse {
                     info: extra_info.to_string(),
+                    status_flags: status,
                     ..Default::default()
                 };
                 self.result.as_mut().unwrap().last_end = Some(Finalizer::Ok(resp));
@@ -488,13 +705,15 @@ impl<'a, W: AsyncWrite + Unpin + 'a> RowWriter<'a, W> {
                 let resp = OkResponse {
                     header: 0xfe,
                     info: extra_info.to_string(),
+                    status_flags: status,
                     ..Default::default()
                 };
                 self.result.as_mut().unwrap().last_end = Some(Finalizer::Ok(resp));
             } else {
                 // we wrote out at least one row
-                self.result.as_mut().unwrap().last_end = Some(Finalizer::Eof);
+                self.result.as_mut().unwrap().last_end = Some(Finalizer::Eof(status));
             }
+            self.result.as_mut().unwrap().default_status_flags = session_status_flags(status);
         }
 
         Ok(())
@@ -537,5 +756,174 @@ impl<'a, W: AsyncWrite + Unpin + 'a> RowWriter<'a, W> {
         self.col = 0;
         self.data.clear();
         self.result.take().unwrap().error(kind, msg).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct PartialFailure;
+
+    #[tokio::test]
+    async fn empty_finalization_does_not_mark_a_missing_response_complete() {
+        for binary in [false, true] {
+            let mut wire = Vec::new();
+            let mut writer = PacketWriter::new(&mut wire);
+            let mut status = StatusFlags::SERVER_STATUS_AUTOCOMMIT;
+            let (response, completed) = QueryResultWriter::new_tracked(
+                &mut writer,
+                binary,
+                CapabilityFlags::CLIENT_PROTOCOL_41,
+                &mut status,
+            );
+            assert_eq!(
+                response.no_more_results().await.unwrap_err().kind(),
+                io::ErrorKind::InvalidData
+            );
+            assert!(!completed.load(Ordering::Acquire));
+            drop(writer);
+            assert!(wire.is_empty());
+            assert_eq!(status, StatusFlags::SERVER_STATUS_AUTOCOMMIT);
+        }
+    }
+
+    impl ToMysqlValue for PartialFailure {
+        fn to_mysql_text<W: Write>(&self, w: &mut W) -> io::Result<()> {
+            w.write_all(b"partial")?;
+            Err(io::Error::new(io::ErrorKind::InvalidData, "encoder failed"))
+        }
+
+        fn to_mysql_bin<W: Write>(&self, w: &mut W, _: &Column) -> io::Result<()> {
+            self.to_mysql_text(w)
+        }
+    }
+
+    #[tokio::test]
+    async fn extra_column_rejection_does_not_corrupt_a_valid_row() {
+        for binary in [false, true] {
+            let columns = [Column {
+                table: String::new(),
+                column: "v".into(),
+                collen: 0,
+                coltype: crate::ColumnType::MYSQL_TYPE_VAR_STRING,
+                colflags: ColumnFlags::empty(),
+            }];
+            let mut wire = Vec::new();
+            let mut writer = PacketWriter::new(&mut wire);
+            let mut rows = QueryResultWriter::new(
+                &mut writer,
+                binary,
+                CapabilityFlags::CLIENT_PROTOCOL_41,
+                StatusFlags::empty(),
+            )
+            .start(&columns)
+            .await
+            .unwrap();
+            rows.write_col("valid").unwrap();
+            let before = rows.data.clone();
+            assert_eq!(
+                rows.write_col("extra").unwrap_err().kind(),
+                io::ErrorKind::InvalidData
+            );
+            assert_eq!(rows.data, before);
+            assert_eq!(rows.col, 1);
+            rows.end_row().await.unwrap();
+            rows.write_row(["next"]).await.unwrap();
+            rows.finish().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn row_limit_and_column_rollback_preserve_wire_payload() {
+        for is_bin in [false, true] {
+            let column = Column {
+                table: String::new(),
+                column: "v".into(),
+                collen: 0,
+                coltype: crate::ColumnType::MYSQL_TYPE_BLOB,
+                colflags: ColumnFlags::empty(),
+            };
+            let columns = [column.clone(), column];
+            let mut wire = Vec::new();
+            let mut writer = PacketWriter::new(&mut wire);
+            let mut rows = QueryResultWriter::new(
+                &mut writer,
+                is_bin,
+                CapabilityFlags::CLIENT_PROTOCOL_41,
+                StatusFlags::SERVER_STATUS_AUTOCOMMIT,
+            )
+            .start(&columns)
+            .await
+            .unwrap();
+            // Two length-prefixed strings, plus the binary row header/null bitmap.
+            let limit = 16 + if is_bin { 2 } else { 0 };
+            rows.result
+                .as_mut()
+                .unwrap()
+                .writer
+                .set_max_packet_size(limit);
+            assert!(rows.write_col(PartialFailure).is_err());
+            assert!(rows.data.is_empty());
+            assert_eq!(rows.col, 0);
+            rows.write_col("1234567").unwrap();
+            let checkpoint = rows.data.clone();
+            assert!(rows.write_col(PartialFailure).is_err());
+            assert_eq!(rows.data, checkpoint);
+            assert_eq!(rows.col, 1);
+            // Each string fits separately, but their combined encoding is one byte over.
+            assert!(rows.write_col("12345678").is_err());
+            assert_eq!(rows.data, checkpoint);
+            assert_eq!(rows.col, 1);
+            rows.write_col("abcdefg").unwrap();
+            assert_eq!(rows.data.len(), limit);
+            rows.end_row().await.unwrap();
+            rows.finish().await.unwrap();
+            drop(writer);
+            let mut packets = Vec::new();
+            let mut remaining = wire.as_slice();
+            while !remaining.is_empty() {
+                let len = usize::from(remaining[0])
+                    | (usize::from(remaining[1]) << 8)
+                    | (usize::from(remaining[2]) << 16);
+                packets.push(remaining[4..4 + len].to_vec());
+                remaining = &remaining[4 + len..];
+            }
+            let mut expected = if is_bin { vec![0, 0] } else { Vec::new() };
+            expected.extend_from_slice(b"\x071234567\x07abcdefg");
+            assert_eq!(packets.len(), 6);
+            assert_eq!(packets[4], expected);
+            assert_eq!(packets[5][0], 0xfe);
+        }
+    }
+
+    #[tokio::test]
+    async fn oversized_row_value_is_rejected_without_buffering_the_value() {
+        for is_bin in [false, true] {
+            let columns = [Column {
+                table: String::new(),
+                column: "payload".to_string(),
+                collen: 0,
+                coltype: crate::ColumnType::MYSQL_TYPE_BLOB,
+                colflags: ColumnFlags::empty(),
+            }];
+            let mut wire = Vec::new();
+            let mut packet_writer = PacketWriter::new(&mut wire);
+            let mut rows = QueryResultWriter::new(
+                &mut packet_writer,
+                is_bin,
+                CapabilityFlags::CLIENT_PROTOCOL_41,
+                StatusFlags::SERVER_STATUS_AUTOCOMMIT,
+            )
+            .start(&columns)
+            .await
+            .unwrap();
+            rows.result.as_mut().unwrap().writer.set_max_packet_size(16);
+
+            let error = rows.write_col(vec![0u8; 1024]).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            assert!(rows.data.is_empty());
+            assert!(rows.data.capacity() < 1024);
+        }
     }
 }

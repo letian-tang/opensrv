@@ -514,8 +514,164 @@ pub(crate) fn packet<'a>(i: NomBytes) -> nom::IResult<NomBytes, (u8, Packet<'a>)
 mod test {
     use bytes::{Buf, BufMut};
     use std::io;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
 
     use super::*;
+
+    // The same deterministic transport exercises sync and async reads. Async
+    // reads yield once before each fragment, including the final EOF/error.
+    struct FragmentedRead<'a> {
+        bytes: &'a [u8],
+        widths: &'a [usize],
+        reads: usize,
+        pending: bool,
+        terminal_error: Option<io::ErrorKind>,
+    }
+
+    impl<'a> FragmentedRead<'a> {
+        fn new(bytes: &'a [u8], widths: &'a [usize], error: Option<io::ErrorKind>) -> Self {
+            Self {
+                bytes,
+                widths,
+                reads: 0,
+                pending: true,
+                terminal_error: error,
+            }
+        }
+    }
+
+    impl Read for FragmentedRead<'_> {
+        fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+            if output.is_empty() {
+                return Ok(0);
+            }
+            if self.bytes.is_empty() {
+                return self.terminal_error.map_or(Ok(0), |kind| {
+                    Err(io::Error::new(kind, "injected transport error"))
+                });
+            }
+            let width = self.widths[self.reads % self.widths.len()];
+            self.reads += 1;
+            let count = width.min(output.len()).min(self.bytes.len());
+            output[..count].copy_from_slice(&self.bytes[..count]);
+            self.bytes = &self.bytes[count..];
+            Ok(count)
+        }
+    }
+
+    impl AsyncRead for FragmentedRead<'_> {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            output: &mut tokio::io::ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            if self.pending {
+                self.pending = false;
+                cx.waker().wake_by_ref();
+                return Poll::Pending;
+            }
+            self.pending = true;
+            let count = Read::read(&mut *self, output.initialize_unfilled())?;
+            output.advance(count);
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn fragmented_reads_preserve_packets_and_classify_every_truncation() {
+        let wire = b"\x03\0\0\xffabc\0\0\0\0\x04\0\0\x01done";
+        let packets = [
+            (7, 255, &b"abc"[..]),
+            (11, 0, &b""[..]),
+            (19, 1, &b"done"[..]),
+        ];
+        for widths in [&[1][..], &[2], &[3], &[4], &[64], &[1, 2, 7, 3]] {
+            for end in 0..=wire.len() {
+                for error in [None, Some(io::ErrorKind::ConnectionReset)] {
+                    let complete: Vec<_> = packets.iter().filter(|p| p.0 <= end).collect();
+                    let at_boundary = end == 0 || packets.iter().any(|p| p.0 == end);
+                    let expected_error =
+                        error.or_else(|| (!at_boundary).then_some(io::ErrorKind::UnexpectedEof));
+                    let mut sync =
+                        PacketReader::new(FragmentedRead::new(&wire[..end], widths, error));
+                    let mut asynchronous =
+                        PacketReader::new(FragmentedRead::new(&wire[..end], widths, error));
+                    for (_, seq, payload) in complete {
+                        let (actual_seq, actual) = sync.next().unwrap().unwrap();
+                        assert_eq!(actual_seq, *seq);
+                        assert_eq!(&*actual, *payload);
+                        let (actual_seq, actual) =
+                            asynchronous.next_async().await.unwrap().unwrap();
+                        assert_eq!(actual_seq, *seq);
+                        assert_eq!(&*actual, *payload);
+                    }
+                    for outcome in [sync.next(), asynchronous.next_async().await] {
+                        match (outcome, expected_error) {
+                            (Ok(None), None) => {}
+                            (Err(actual), Some(expected)) => assert_eq!(actual.kind(), expected),
+                            _ => panic!(
+                                "unexpected result: end={end}, widths={widths:?}, error={error:?}"
+                            ),
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn fragmented_multi_frame_reads_check_sequence_terminator_and_limit() {
+        let mut wire = vec![0xff; U24_MAX + 4]; // full frame, sequence 255
+        wire.extend_from_slice(&[7, 0, 0, 0]); // sequence rollover
+        wire.extend_from_slice(b"payload");
+        wire.extend_from_slice(b"\x04\0\0\x01next");
+        let full_end = U24_MAX + 4;
+        let logical_end = full_end + 11;
+        for widths in [&[1, 2, 1, 65536][..], &[65535], &[1024 * 1024]] {
+            let mut reader = PacketReader::new_with_max_packet_size(
+                FragmentedRead::new(&wire, widths, None),
+                U24_MAX + 7,
+            );
+            let (seq, payload) = reader.next_async().await.unwrap().unwrap();
+            assert_eq!(seq, 0);
+            assert_eq!(payload.first_seq, 255);
+            assert_eq!(payload.len(), U24_MAX + 7);
+            assert!(payload[..U24_MAX].iter().all(|byte| *byte == 0xff));
+            assert_eq!(&payload[U24_MAX..], b"payload");
+            let (seq, payload) = reader.next_async().await.unwrap().unwrap();
+            assert_eq!((seq, &*payload), (1, &b"next"[..]));
+            assert!(reader.next_async().await.unwrap().is_none());
+
+            for end in full_end..logical_end {
+                let mut reader = PacketReader::new(FragmentedRead::new(&wire[..end], widths, None));
+                assert_eq!(
+                    reader.next_async().await.err().unwrap().kind(),
+                    io::ErrorKind::UnexpectedEof
+                );
+            }
+            // Three length bytes suffice to reject the combined payload size;
+            // the missing sequence byte/body must not turn it into an EOF error.
+            let mut reader = PacketReader::new_with_max_packet_size(
+                FragmentedRead::new(&wire[..full_end + 3], widths, None),
+                U24_MAX,
+            );
+            assert_eq!(
+                reader.next_async().await.err().unwrap().kind(),
+                io::ErrorKind::InvalidData
+            );
+        }
+        wire[full_end + 3] = 2;
+        let mut reader = PacketReader::new(FragmentedRead::new(
+            &wire[..full_end + 4],
+            &[1, 65536],
+            None,
+        ));
+        assert_eq!(
+            reader.next_async().await.err().unwrap().kind(),
+            io::ErrorKind::InvalidData
+        );
+    }
 
     fn mock_packet(mut data: bytes::Bytes, start_seq: u8) -> bytes::Bytes {
         let mut buf = BytesMut::new();

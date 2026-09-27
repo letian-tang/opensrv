@@ -76,6 +76,9 @@ pub fn client_handshake(i: &[u8], after_tls: bool) -> nom::IResult<&[u8], Client
         let (i, auth_response) =
             if capabilities.contains(CapabilityFlags::CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA) {
                 let (i, size) = read_length_encoded_number(i)?;
+                let size = usize::try_from(size).map_err(|_| {
+                    nom::Err::Error(nom::error::Error::new(i, nom::error::ErrorKind::TooLarge))
+                })?;
                 nom::bytes::complete::take(size)(i)?
             } else if capabilities.contains(CapabilityFlags::CLIENT_SECURE_CONNECTION) {
                 let (i, size) = nom::number::complete::le_u8(i)?;
@@ -86,24 +89,22 @@ pub fn client_handshake(i: &[u8], after_tls: bool) -> nom::IResult<&[u8], Client
                 (i, auth_response)
             };
 
-        let (i, db) =
-            if capabilities.contains(CapabilityFlags::CLIENT_CONNECT_WITH_DB) && !i.is_empty() {
-                let (i, db) = nom::bytes::complete::take_until(&b"\0"[..])(i)?;
-                let (i, _) = nom::bytes::complete::tag(b"\0")(i)?;
-                (i, Some(db))
-            } else {
-                (i, None)
-            };
+        let (i, db) = if capabilities.contains(CapabilityFlags::CLIENT_CONNECT_WITH_DB) {
+            let (i, db) = nom::bytes::complete::take_until(&b"\0"[..])(i)?;
+            let (i, _) = nom::bytes::complete::tag(b"\0")(i)?;
+            (i, Some(db))
+        } else {
+            (i, None)
+        };
 
-        let (i, auth_plugin) =
-            if capabilities.contains(CapabilityFlags::CLIENT_PLUGIN_AUTH) && !i.is_empty() {
-                let (i, auth_plugin) = nom::bytes::complete::take_until(&b"\0"[..])(i)?;
+        let (i, auth_plugin) = if capabilities.contains(CapabilityFlags::CLIENT_PLUGIN_AUTH) {
+            let (i, auth_plugin) = nom::bytes::complete::take_until(&b"\0"[..])(i)?;
 
-                let (i, _) = nom::bytes::complete::tag(b"\0")(i)?;
-                (i, auth_plugin)
-            } else {
-                (i, &b""[..])
-            };
+            let (i, _) = nom::bytes::complete::tag(b"\0")(i)?;
+            (i, auth_plugin)
+        } else {
+            (i, &b""[..])
+        };
 
         Ok((
             i,
@@ -158,7 +159,12 @@ pub fn client_handshake(i: &[u8], after_tls: bool) -> nom::IResult<&[u8], Client
 fn read_length_encoded_number(i: &[u8]) -> nom::IResult<&[u8], u64> {
     let (i, b) = nom::number::complete::le_u8(i)?;
     let size: usize = match b {
-        0xfb => return Ok((i, 0)),
+        0xfb | 0xff => {
+            return Err(nom::Err::Error(nom::error::Error::new(
+                i,
+                nom::error::ErrorKind::Verify,
+            )))
+        }
         0xfc => 2,
         0xfd => 3,
         0xfe => 8,

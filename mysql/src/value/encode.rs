@@ -26,6 +26,13 @@ pub trait ToMysqlValue {
     /// Encode value using the text-based protocol.
     fn to_mysql_text<W: Write>(&self, w: &mut W) -> io::Result<()>;
 
+    /// Encode text with its declared column type. The default preserves custom
+    /// encoders; override when a value represents multiple SQL types (e.g. DATE
+    /// and DATETIME). RowWriter uses this method for text resultsets.
+    fn to_mysql_text_with_column<W: Write>(&self, w: &mut W, _c: &Column) -> io::Result<()> {
+        self.to_mysql_text(w)
+    }
+
     /// Encode value using the binary protocol.
     fn to_mysql_bin<W: Write>(&self, w: &mut W, c: &Column) -> io::Result<()>;
 
@@ -73,32 +80,27 @@ where
         }
     }
 
+    fn to_mysql_text_with_column<W: Write>(&self, w: &mut W, c: &Column) -> io::Result<()> {
+        match self {
+            Some(value) => value.to_mysql_text_with_column(w, c),
+            None => w.write_u8(0xfb),
+        }
+    }
+
     fn is_null(&self) -> bool {
         self.is_none()
     }
 }
 
-// NOTE: these rules can all go away when TryFrom stabilizes
-//       see https://github.com/jonhoo/msql-srv/commit/13e5e753e5042a42cc45ad57c2b760561da2fb50
 // NOTE: yes, I know the = / => distinction is ugly
 macro_rules! like_try_into {
     ($self:ident, $source:ty = $target:ty, $w:ident, $m:ident, $c:ident) => {{
-        let min = <$target>::MIN as $source;
-        let max = <$target>::MAX as $source;
-        if *$self <= max && *$self >= min {
-            $w.$m(*$self as $target)
-        } else {
-            Err(bad($self, $c))
-        }
+        let value = <$target>::try_from(*$self).map_err(|_| bad($self, $c))?;
+        $w.$m(value)
     }};
     ($self:ident, $source:ty => $target:ty, $w:ident, $m:ident, $c:ident) => {{
-        let min = <$target>::MIN as $source;
-        let max = <$target>::MAX as $source;
-        if *$self <= max && *$self >= min {
-            $w.$m::<LittleEndian>(*$self as $target)
-        } else {
-            Err(bad($self, $c))
-        }
+        let value = <$target>::try_from(*$self).map_err(|_| bad($self, $c))?;
+        $w.$m::<LittleEndian>(value)
     }};
 }
 
@@ -194,21 +196,21 @@ impl ToMysqlValue for i8 {
                 if signed {
                     w.write_i64::<LittleEndian>(i64::from(*self))
                 } else {
-                    w.write_u64::<LittleEndian>(*self as u64)
+                    w.write_u64::<LittleEndian>(u64::try_from(*self).map_err(|_| bad(self, c))?)
                 }
             }
             ColumnType::MYSQL_TYPE_LONG | ColumnType::MYSQL_TYPE_INT24 => {
                 if signed {
                     w.write_i32::<LittleEndian>(i32::from(*self))
                 } else {
-                    w.write_u32::<LittleEndian>(*self as u32)
+                    w.write_u32::<LittleEndian>(u32::try_from(*self).map_err(|_| bad(self, c))?)
                 }
             }
             ColumnType::MYSQL_TYPE_SHORT | ColumnType::MYSQL_TYPE_YEAR => {
                 if signed {
                     w.write_i16::<LittleEndian>(i16::from(*self))
                 } else {
-                    w.write_u16::<LittleEndian>(*self as u16)
+                    w.write_u16::<LittleEndian>(u16::try_from(*self).map_err(|_| bad(self, c))?)
                 }
             }
             ColumnType::MYSQL_TYPE_TINY => {
@@ -263,14 +265,14 @@ impl ToMysqlValue for i16 {
                 if signed {
                     w.write_i64::<LittleEndian>(i64::from(*self))
                 } else {
-                    w.write_u64::<LittleEndian>(*self as u64)
+                    w.write_u64::<LittleEndian>(u64::try_from(*self).map_err(|_| bad(self, c))?)
                 }
             }
             ColumnType::MYSQL_TYPE_LONG | ColumnType::MYSQL_TYPE_INT24 => {
                 if signed {
                     w.write_i32::<LittleEndian>(i32::from(*self))
                 } else {
-                    w.write_u32::<LittleEndian>(*self as u32)
+                    w.write_u32::<LittleEndian>(u32::try_from(*self).map_err(|_| bad(self, c))?)
                 }
             }
             ColumnType::MYSQL_TYPE_SHORT | ColumnType::MYSQL_TYPE_YEAR => {
@@ -318,7 +320,7 @@ impl ToMysqlValue for i32 {
                 if signed {
                     w.write_i64::<LittleEndian>(i64::from(*self))
                 } else {
-                    w.write_u64::<LittleEndian>(*self as u64)
+                    w.write_u64::<LittleEndian>(u64::try_from(*self).map_err(|_| bad(self, c))?)
                 }
             }
             ColumnType::MYSQL_TYPE_LONG | ColumnType::MYSQL_TYPE_INT24 => {
@@ -447,14 +449,41 @@ where
     fn to_mysql_text<W: Write>(&self, w: &mut W) -> io::Result<()> {
         (*self).to_mysql_text(w)
     }
+    fn to_mysql_text_with_column<W: Write>(&self, w: &mut W, c: &Column) -> io::Result<()> {
+        (*self).to_mysql_text_with_column(w, c)
+    }
     fn to_mysql_bin<W: Write>(&self, w: &mut W, c: &Column) -> io::Result<()> {
         (*self).to_mysql_bin(w, c)
     }
 }
 
 use chrono::{self, Datelike, NaiveDate, NaiveDateTime, Timelike};
+
+fn mysql_chrono_year(date: NaiveDate) -> io::Result<u16> {
+    let year = date.year();
+    if !(0..=9999).contains(&year) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "date year outside MySQL range 0..=9999",
+        ));
+    }
+    Ok(year as u16)
+}
+
+fn validate_chrono_datetime(value: &NaiveDateTime) -> io::Result<u16> {
+    let year = mysql_chrono_year(value.date())?;
+    if value.nanosecond() >= 1_000_000_000 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "MySQL does not support chrono leap seconds",
+        ));
+    }
+    Ok(year)
+}
+
 impl ToMysqlValue for NaiveDate {
     fn to_mysql_text<W: Write>(&self, w: &mut W) -> io::Result<()> {
+        mysql_chrono_year(*self)?;
         w.write_lenenc_str(
             format!("{:04}-{:02}-{:02}", self.year(), self.month(), self.day()).as_bytes(),
         )
@@ -463,8 +492,9 @@ impl ToMysqlValue for NaiveDate {
     fn to_mysql_bin<W: Write>(&self, w: &mut W, c: &Column) -> io::Result<()> {
         match c.coltype {
             ColumnType::MYSQL_TYPE_DATE => {
+                let year = mysql_chrono_year(*self)?;
                 w.write_u8(4u8)?;
-                w.write_u16::<LittleEndian>(self.year() as u16)?;
+                w.write_u16::<LittleEndian>(year)?;
                 w.write_u8(self.month() as u8)?;
                 w.write_u8(self.day() as u8)
             }
@@ -475,6 +505,7 @@ impl ToMysqlValue for NaiveDate {
 
 impl ToMysqlValue for NaiveDateTime {
     fn to_mysql_text<W: Write>(&self, w: &mut W) -> io::Result<()> {
+        validate_chrono_datetime(self)?;
         let us = self.nanosecond() / 1_000;
 
         if us != 0 {
@@ -511,6 +542,7 @@ impl ToMysqlValue for NaiveDateTime {
     fn to_mysql_bin<W: Write>(&self, w: &mut W, c: &Column) -> io::Result<()> {
         match c.coltype {
             ColumnType::MYSQL_TYPE_DATETIME | ColumnType::MYSQL_TYPE_TIMESTAMP => {
+                let year = validate_chrono_datetime(self)?;
                 let us = self.nanosecond() / 1_000;
 
                 if us != 0 {
@@ -518,7 +550,7 @@ impl ToMysqlValue for NaiveDateTime {
                 } else {
                     w.write_u8(7u8)?;
                 }
-                w.write_u16::<LittleEndian>(self.year() as u16)?;
+                w.write_u16::<LittleEndian>(year)?;
                 w.write_u8(self.month() as u8)?;
                 w.write_u8(self.day() as u8)?;
                 w.write_u8(self.hour() as u8)?;
@@ -539,7 +571,10 @@ use std::time::Duration;
 const MYSQL_TIME_MAX_SECONDS: u64 = 838 * 3600 + 59 * 60 + 59;
 
 fn validate_mysql_duration(value: &Duration) -> io::Result<()> {
-    if value.as_secs() > MYSQL_TIME_MAX_SECONDS {
+    // Match MySQL's check_time_range_quick at the encoded microsecond precision.
+    if value.as_secs() > MYSQL_TIME_MAX_SECONDS
+        || (value.as_secs() == MYSQL_TIME_MAX_SECONDS && value.subsec_micros() != 0)
+    {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "MySQL TIME exceeds 838:59:59",
@@ -550,55 +585,74 @@ fn validate_mysql_duration(value: &Duration) -> io::Result<()> {
 
 impl ToMysqlValue for Duration {
     fn to_mysql_text<W: Write>(&self, w: &mut W) -> io::Result<()> {
-        validate_mysql_duration(self)?;
-        let s = self.as_secs();
-        let h = s / 3600;
-        let m = (s % 3600) / 60;
-        let s = s % 60;
-        let us = self.subsec_micros();
-        if us != 0 {
-            w.write_lenenc_str(format!("{:02}:{:02}:{:02}.{:06}", h, m, s, us).as_bytes())
-                .map(|_| ())
-        } else {
-            w.write_lenenc_str(format!("{:02}:{:02}:{:02}", h, m, s).as_bytes())
-                .map(|_| ())
-        }
+        write_mysql_time_text(w, *self, false)
     }
 
-    #[allow(clippy::many_single_char_names)]
     fn to_mysql_bin<W: Write>(&self, w: &mut W, c: &Column) -> io::Result<()> {
-        if c.coltype != ColumnType::MYSQL_TYPE_TIME {
-            return Err(bad(self, c));
-        }
-        validate_mysql_duration(self)?;
-        let s = self.as_secs();
-        let d = s / (24 * 3600);
-        let h = (s % (24 * 3600)) / 3600;
-        let m = (s % 3600) / 60;
-        let s = s % 60;
-        let us = self.subsec_micros();
-
-        if self.as_secs() == 0 && us == 0 {
-            w.write_u8(0u8)?;
-        } else {
-            if us != 0 {
-                w.write_u8(12u8)?;
-            } else {
-                w.write_u8(8u8)?;
-            }
-
-            w.write_u8(0u8)?; // positive only (for now)
-            w.write_u32::<LittleEndian>(d as u32)?;
-            w.write_u8(h as u8)?;
-            w.write_u8(m as u8)?;
-            w.write_u8(s as u8)?;
-
-            if us != 0 {
-                w.write_u32::<LittleEndian>(us)?;
-            }
-        }
-        Ok(())
+        write_mysql_time_bin(w, c, *self, false)
     }
+}
+
+fn write_mysql_time_text<W: Write>(w: &mut W, value: Duration, negative: bool) -> io::Result<()> {
+    validate_mysql_duration(&value)?;
+    let s = value.as_secs();
+    let h = s / 3600;
+    let m = (s % 3600) / 60;
+    let s = s % 60;
+    let us = value.subsec_micros();
+    // MySQL has no distinct negative zero representation.
+    let sign = if negative && (value.as_secs() != 0 || us != 0) {
+        "-"
+    } else {
+        ""
+    };
+    if us != 0 {
+        w.write_lenenc_str(format!("{sign}{h:02}:{m:02}:{s:02}.{us:06}").as_bytes())
+            .map(|_| ())
+    } else {
+        w.write_lenenc_str(format!("{sign}{h:02}:{m:02}:{s:02}").as_bytes())
+            .map(|_| ())
+    }
+}
+
+#[allow(clippy::many_single_char_names)]
+fn write_mysql_time_bin<W: Write>(
+    w: &mut W,
+    c: &Column,
+    value: Duration,
+    negative: bool,
+) -> io::Result<()> {
+    if c.coltype != ColumnType::MYSQL_TYPE_TIME {
+        return Err(bad(value, c));
+    }
+    validate_mysql_duration(&value)?;
+    let s = value.as_secs();
+    let d = s / (24 * 3600);
+    let h = (s % (24 * 3600)) / 3600;
+    let m = (s % 3600) / 60;
+    let s = s % 60;
+    let us = value.subsec_micros();
+
+    if value.as_secs() == 0 && us == 0 {
+        w.write_u8(0u8)?;
+    } else {
+        if us != 0 {
+            w.write_u8(12u8)?;
+        } else {
+            w.write_u8(8u8)?;
+        }
+
+        w.write_u8(u8::from(negative))?;
+        w.write_u32::<LittleEndian>(d as u32)?;
+        w.write_u8(h as u8)?;
+        w.write_u8(m as u8)?;
+        w.write_u8(s as u8)?;
+
+        if us != 0 {
+            w.write_u32::<LittleEndian>(us)?;
+        }
+    }
+    Ok(())
 }
 
 fn mysql_time_duration(d: u32, h: u8, m: u8, s: u8, us: u32) -> io::Result<Duration> {
@@ -631,6 +685,21 @@ fn validate_mysql_date(y: u16, mo: u8, d: u8, h: u8, mi: u8, s: u8, us: u32) -> 
 }
 
 impl ToMysqlValue for myc::value::Value {
+    fn to_mysql_text_with_column<W: Write>(&self, w: &mut W, c: &Column) -> io::Result<()> {
+        if let Self::Date(year, month, day, hour, minute, second, micros) = *self {
+            if c.coltype == ColumnType::MYSQL_TYPE_DATE {
+                validate_mysql_date(year, month, day, hour, minute, second, micros)?;
+                if hour != 0 || minute != 0 || second != 0 || micros != 0 {
+                    return Err(bad(self, c));
+                }
+                return w
+                    .write_lenenc_str(format!("{year:04}-{month:02}-{day:02}").as_bytes())
+                    .map(|_| ());
+            }
+        }
+        self.to_mysql_text(w)
+    }
+
     #[allow(clippy::many_single_char_names)]
     fn to_mysql_text<W: Write>(&self, w: &mut W) -> io::Result<()> {
         match *self {
@@ -649,10 +718,7 @@ impl ToMysqlValue for myc::value::Value {
                 w.write_lenenc_str(text.as_bytes()).map(|_| ())
             }
             myc::value::Value::Time(neg, d, h, m, s, us) => {
-                if neg {
-                    return Err(io::Error::other("negative times not yet supported"));
-                }
-                mysql_time_duration(d, h, m, s, us)?.to_mysql_text(w)
+                write_mysql_time_text(w, mysql_time_duration(d, h, m, s, us)?, neg)
             }
         }
     }
@@ -731,10 +797,7 @@ impl ToMysqlValue for myc::value::Value {
                 Ok(())
             }
             myc::value::Value::Time(neg, d, h, m, s, us) => {
-                if neg {
-                    return Err(io::Error::other("negative times not yet supported"));
-                }
-                mysql_time_duration(d, h, m, s, us)?.to_mysql_bin(w, c)
+                write_mysql_time_bin(w, c, mysql_time_duration(d, h, m, s, us)?, neg)
             }
         }
     }

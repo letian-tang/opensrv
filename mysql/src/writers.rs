@@ -17,7 +17,7 @@ use std::io::{self, Write};
 use crate::myc::constants::{CapabilityFlags, StatusFlags};
 use crate::myc::io::WriteMysqlExt;
 use crate::packet_writer::PacketWriter;
-use crate::{Column, ColumnFlags, ColumnType, ErrorKind, OkResponse};
+use crate::{Column, ColumnFlags, ColumnMetadata, ColumnType, ErrorKind, OkResponse};
 use byteorder::{LittleEndian, WriteBytesExt};
 use tokio::io::AsyncWrite;
 
@@ -121,10 +121,11 @@ pub(crate) async fn write_prepare_ok<'a, PI, CI, W>(
     columns: CI,
     w: &mut PacketWriter<W>,
     client_capabilities: CapabilityFlags,
+    status_flags: StatusFlags,
 ) -> io::Result<()>
 where
-    PI: IntoIterator<Item = &'a Column>,
-    CI: IntoIterator<Item = &'a Column>,
+    PI: IntoIterator<Item = (&'a Column, ColumnMetadata)>,
+    CI: IntoIterator<Item = (&'a Column, ColumnMetadata)>,
     <PI as IntoIterator>::IntoIter: ExactSizeIterator,
     <CI as IntoIterator>::IntoIter: ExactSizeIterator,
     W: AsyncWrite + Unpin,
@@ -142,10 +143,10 @@ where
     w.end_packet().await?;
 
     if pi.len() > 0 {
-        write_column_definitions_41(pi, w, client_capabilities, false).await?;
+        write_column_definitions_41(pi, w, client_capabilities, false, status_flags).await?;
     }
     if ci.len() > 0 {
-        write_column_definitions_41(ci, w, client_capabilities, false).await?;
+        write_column_definitions_41(ci, w, client_capabilities, false, status_flags).await?;
     }
     Ok(())
 }
@@ -157,12 +158,13 @@ pub(crate) async fn write_column_definitions_41<'a, I, W>(
     w: &mut PacketWriter<W>,
     client_capabilities: CapabilityFlags,
     is_com_field_list: bool,
+    status_flags: StatusFlags,
 ) -> io::Result<()>
 where
-    I: IntoIterator<Item = &'a Column>,
+    I: IntoIterator<Item = (&'a Column, ColumnMetadata)>,
     W: AsyncWrite + Unpin,
 {
-    for c in i {
+    for (c, metadata) in i {
         w.write_lenenc_str(b"def")?;
         w.write_lenenc_str(b"")?;
         w.write_lenenc_str(c.table.as_bytes())?;
@@ -170,12 +172,12 @@ where
         w.write_lenenc_str(c.column.as_bytes())?;
         w.write_lenenc_str(b"")?;
         w.write_lenenc_int(0xC)?;
-        w.write_u16::<LittleEndian>(column_charset(c))?;
+        w.write_u16::<LittleEndian>(metadata.collation.unwrap_or_else(|| column_charset(c)))?;
         let column_length = if c.collen == 0 { 1024 } else { c.collen };
         w.write_u32::<LittleEndian>(column_length)?;
         w.write_u8(c.coltype as u8)?;
         w.write_u16::<LittleEndian>(c.colflags.bits())?;
-        w.write_all(&[0x00])?; // decimals
+        w.write_u8(metadata.decimals)?;
         w.write_all(&[0x00, 0x00])?; // unused
 
         if is_com_field_list {
@@ -185,7 +187,7 @@ where
     }
 
     if !client_capabilities.contains(CapabilityFlags::CLIENT_DEPRECATE_EOF) {
-        write_eof_packet(w, StatusFlags::empty()).await
+        write_eof_packet(w, status_flags).await
     } else {
         Ok(())
     }
@@ -195,16 +197,17 @@ pub(crate) async fn column_definitions<'a, I, W>(
     i: I,
     w: &mut PacketWriter<W>,
     client_capabilities: CapabilityFlags,
+    status_flags: StatusFlags,
 ) -> io::Result<()>
 where
-    I: IntoIterator<Item = &'a Column>,
+    I: IntoIterator<Item = (&'a Column, ColumnMetadata)>,
     <I as IntoIterator>::IntoIter: ExactSizeIterator,
     W: AsyncWrite + Unpin,
 {
     let i = i.into_iter();
     w.write_lenenc_int(i.len() as u64)?;
     w.end_packet().await?;
-    write_column_definitions_41(i, w, client_capabilities, false).await
+    write_column_definitions_41(i, w, client_capabilities, false, status_flags).await
 }
 
 #[cfg(test)]

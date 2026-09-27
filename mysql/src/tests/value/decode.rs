@@ -169,6 +169,34 @@ rt!(
 rt!(string, &str, "foobar", ColumnType::MYSQL_TYPE_STRING);
 
 #[test]
+fn length_encoded_value_does_not_truncate_large_lengths() {
+    for length in [u64::MAX, 0x1_0000_0001] {
+        let mut bytes = vec![0xfe];
+        bytes.extend_from_slice(&length.to_le_bytes());
+        bytes.push(b'x');
+        assert!(Value::parse_from(
+            &mut bytes.as_slice(),
+            ColumnType::MYSQL_TYPE_VAR_STRING,
+            false
+        )
+        .is_err());
+    }
+}
+
+#[test]
+fn datetime_fraction_does_not_become_a_chrono_leap_second() {
+    let mut bytes = vec![11, 224, 7, 12, 31, 23, 59, 59];
+    bytes.extend_from_slice(&1_500_000u32.to_le_bytes());
+    let value = Value::parse_from(
+        &mut bytes.as_slice(),
+        ColumnType::MYSQL_TYPE_DATETIME,
+        false,
+    )
+    .unwrap();
+    assert!(chrono::NaiveDateTime::try_from(value).is_err());
+}
+
+#[test]
 fn time_fraction_is_preserved_and_invalid_fraction_rejected() {
     for micros in [0u32, 1, 123456, 999999, 1000000, u32::MAX] {
         let mut bytes = vec![12, 0, 0, 0, 0, 0, 0, 0, 1];

@@ -380,6 +380,57 @@ struct WireShim {
     auth_plugin: &'static str,
 }
 
+struct RejectInitShim;
+
+#[async_trait]
+impl AsyncMysqlShim<BufWriter<OwnedWriteHalf>> for RejectInitShim {
+    type Error = io::Error;
+
+    async fn authenticate(&self, _: &str, _: &[u8], _: &[u8], _: &[u8]) -> bool {
+        true
+    }
+
+    async fn on_prepare<'a>(
+        &'a mut self,
+        _: &'a str,
+        _: StatementMetaWriter<'a, BufWriter<OwnedWriteHalf>>,
+    ) -> io::Result<()> {
+        unreachable!()
+    }
+
+    async fn on_execute<'a>(
+        &'a mut self,
+        _: u32,
+        _: ParamParser<'a>,
+        _: QueryResultWriter<'a, BufWriter<OwnedWriteHalf>>,
+    ) -> io::Result<()> {
+        unreachable!()
+    }
+
+    async fn on_close(&mut self, _: u32) {}
+
+    async fn on_query<'a>(
+        &'a mut self,
+        _: &'a str,
+        results: QueryResultWriter<'a, BufWriter<OwnedWriteHalf>>,
+    ) -> io::Result<()> {
+        results.completed(OkResponse::default()).await
+    }
+
+    async fn on_init<'a>(
+        &'a mut self,
+        _: &'a str,
+        writer: InitWriter<'a, BufWriter<OwnedWriteHalf>>,
+    ) -> io::Result<()> {
+        writer
+            .error(
+                ErrorKind::ER_DBACCESS_DENIED_ERROR,
+                b"database access denied",
+            )
+            .await
+    }
+}
+
 struct DefaultAuthShim;
 
 #[async_trait]
@@ -466,7 +517,7 @@ async fn auth_switch_uses_saved_scramble_and_preserves_sequence() {
             assert_eq!(packet[0], 0xff);
             assert_eq!(
                 u16::from_le_bytes([packet[1], packet[2]]),
-                ErrorKind::ER_ACCESS_DENIED_NO_PASSWORD_ERROR as u16
+                ErrorKind::ER_ACCESS_DENIED_ERROR as u16
             );
         }
         let result = timeout(Duration::from_secs(2), server)
@@ -795,6 +846,25 @@ impl AsyncMysqlShim<BufWriter<OwnedWriteHalf>> for WireShim {
         _query: &'a str,
         _results: QueryResultWriter<'a, BufWriter<OwnedWriteHalf>>,
     ) -> Result<(), Self::Error> {
+        if _query == "SELECT oversized_row" {
+            let column = Column {
+                table: String::new(),
+                column: "v".into(),
+                collen: 0,
+                coltype: myc::constants::ColumnType::MYSQL_TYPE_BLOB,
+                colflags: myc::constants::ColumnFlags::empty(),
+            };
+            let columns = [column.clone(), column];
+            let mut rows = _results.start(&columns).await?;
+            rows.write_col("prefix")?;
+            assert_eq!(
+                rows.write_col(vec![0u8; 1024]).unwrap_err().kind(),
+                io::ErrorKind::InvalidData
+            );
+            return rows
+                .finish_error(ErrorKind::ER_NET_PACKET_TOO_LARGE, b"row too large")
+                .await;
+        }
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "query unsupported",
@@ -1076,6 +1146,93 @@ async fn greeting_advertises_utf8mb4_autocommit_and_multi_results() {
 }
 
 #[tokio::test]
+async fn max_allowed_packet_reports_the_configured_protocol_limit() {
+    let (mut client, server) = start_wire_server_with_options(
+        WireShim {
+            auth_plugin: opensrv_mysql::MYSQL_NATIVE_PASSWORD,
+        },
+        IntermediaryOptions {
+            max_packet_size: Some(4096),
+            ..Default::default()
+        },
+    )
+    .await;
+    read_wire_packet(&mut client).await.unwrap();
+    write_wire_packet(
+        &mut client,
+        1,
+        &handshake_response(opensrv_mysql::MYSQL_NATIVE_PASSWORD, None),
+    )
+    .await
+    .unwrap();
+    assert_eq!(read_wire_packet(&mut client).await.unwrap().1[0], 0x00);
+
+    write_wire_packet(&mut client, 0, b"\x03SELECT @@max_allowed_packet")
+        .await
+        .unwrap();
+    assert_eq!(read_wire_packet(&mut client).await.unwrap(), (1, vec![1]));
+    assert_eq!(read_wire_packet(&mut client).await.unwrap().0, 2);
+    assert_eq!(read_wire_packet(&mut client).await.unwrap().1[0], 0xfe);
+    let (seq, row) = read_wire_packet(&mut client).await.unwrap();
+    assert_eq!(seq, 4);
+    let value_len = usize::from(row[0]);
+    assert_eq!(&row[1..1 + value_len], b"4096");
+    assert_eq!(read_wire_packet(&mut client).await.unwrap().1[0], 0xfe);
+
+    write_wire_packet(&mut client, 0, b"\x01").await.unwrap();
+    drop(client);
+    server.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn oversized_row_error_preserves_connection_and_packet_sequence() {
+    let (mut client, server) = start_wire_server_with_options(
+        WireShim {
+            auth_plugin: opensrv_mysql::MYSQL_NATIVE_PASSWORD,
+        },
+        IntermediaryOptions {
+            max_packet_size: Some(128),
+            ..Default::default()
+        },
+    )
+    .await;
+    timeout(Duration::from_secs(2), async {
+        read_wire_packet(&mut client).await.unwrap();
+        write_wire_packet(
+            &mut client,
+            1,
+            &handshake_response(opensrv_mysql::MYSQL_NATIVE_PASSWORD, None),
+        )
+        .await
+        .unwrap();
+        assert_eq!(read_wire_packet(&mut client).await.unwrap().1[0], 0);
+        write_wire_packet(&mut client, 0, b"\x03SELECT oversized_row")
+            .await
+            .unwrap();
+        assert_eq!(read_wire_packet(&mut client).await.unwrap(), (1, vec![2]));
+        for seq in 2..=3 {
+            assert_eq!(read_wire_packet(&mut client).await.unwrap().0, seq);
+        }
+        let (seq, eof) = read_wire_packet(&mut client).await.unwrap();
+        assert_eq!((seq, eof[0]), (4, 0xfe));
+        let (seq, error) = read_wire_packet(&mut client).await.unwrap();
+        assert_eq!((seq, error[0]), (5, 0xff));
+        assert_eq!(
+            u16::from_le_bytes([error[1], error[2]]),
+            ErrorKind::ER_NET_PACKET_TOO_LARGE as u16
+        );
+        assert_eq!(&error[9..], b"row too large");
+        write_wire_packet(&mut client, 0, b"\x0e").await.unwrap();
+        let (seq, ok) = read_wire_packet(&mut client).await.unwrap();
+        assert_eq!((seq, ok[0]), (1, 0));
+        write_wire_packet(&mut client, 0, b"\x01").await.unwrap();
+        server.await.unwrap().unwrap();
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
 async fn default_on_init_acks_initial_and_command_database_changes() {
     let (mut client, server) = start_wire_server(WireShim {
         auth_plugin: opensrv_mysql::MYSQL_NATIVE_PASSWORD,
@@ -1109,6 +1266,63 @@ async fn default_on_init_acks_initial_and_command_database_changes() {
     assert_eq!(seq, 1);
     assert_eq!(payload[0], 0x00);
 
+    write_wire_packet(&mut client, 0, b"\x01").await.unwrap();
+    drop(client);
+    server.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn rejected_initial_database_terminates_handshake() {
+    let (mut client, server) = start_wire_server(RejectInitShim).await;
+    read_wire_packet(&mut client).await.unwrap();
+    write_wire_packet(
+        &mut client,
+        1,
+        &handshake_response(opensrv_mysql::MYSQL_NATIVE_PASSWORD, Some("denied")),
+    )
+    .await
+    .unwrap();
+
+    let (seq, payload) = read_wire_packet(&mut client).await.unwrap();
+    assert_eq!(seq, 2);
+    assert_eq!(payload[0], 0xff);
+    assert_eq!(
+        u16::from_le_bytes([payload[1], payload[2]]),
+        ErrorKind::ER_DBACCESS_DENIED_ERROR as u16
+    );
+    assert!(read_wire_packet(&mut client).await.is_err());
+    assert_eq!(
+        server.await.unwrap().unwrap_err().kind(),
+        io::ErrorKind::ConnectionAborted
+    );
+}
+
+#[tokio::test]
+async fn rejected_com_init_db_keeps_connection_open() {
+    let (mut client, server) = start_wire_server(RejectInitShim).await;
+    read_wire_packet(&mut client).await.unwrap();
+    write_wire_packet(
+        &mut client,
+        1,
+        &handshake_response(opensrv_mysql::MYSQL_NATIVE_PASSWORD, None),
+    )
+    .await
+    .unwrap();
+    assert_eq!(read_wire_packet(&mut client).await.unwrap().1[0], 0x00);
+
+    write_wire_packet(&mut client, 0, b"\x02denied")
+        .await
+        .unwrap();
+    let (seq, payload) = read_wire_packet(&mut client).await.unwrap();
+    assert_eq!(seq, 1);
+    assert_eq!(payload[0], 0xff);
+    assert_eq!(
+        u16::from_le_bytes([payload[1], payload[2]]),
+        ErrorKind::ER_DBACCESS_DENIED_ERROR as u16
+    );
+
+    write_wire_packet(&mut client, 0, b"\x0e").await.unwrap();
+    assert_eq!(read_wire_packet(&mut client).await.unwrap().1[0], 0x00);
     write_wire_packet(&mut client, 0, b"\x01").await.unwrap();
     drop(client);
     server.await.unwrap().unwrap();
@@ -1162,7 +1376,7 @@ async fn default_shim_authentication_is_fail_closed() {
     assert_eq!(payload[0], 0xff);
     assert_eq!(
         u16::from_le_bytes([payload[1], payload[2]]),
-        ErrorKind::ER_ACCESS_DENIED_NO_PASSWORD_ERROR as u16
+        ErrorKind::ER_ACCESS_DENIED_ERROR as u16
     );
     assert_eq!(
         server.await.unwrap().unwrap_err().kind(),
@@ -1220,7 +1434,7 @@ async fn caching_sha2_rejects_nonempty_response_without_digest_length() {
     assert_eq!(payload[0], 0xff);
     assert_eq!(
         u16::from_le_bytes([payload[1], payload[2]]),
-        ErrorKind::ER_ACCESS_DENIED_NO_PASSWORD_ERROR as u16
+        ErrorKind::ER_ACCESS_DENIED_ERROR as u16
     );
 
     let err = server.await.unwrap().unwrap_err();
@@ -1236,7 +1450,7 @@ async fn prepare_wire_statement(client: &mut TcpStream) {
     assert_eq!(seq, 2);
     let (seq, payload) = read_wire_packet(client).await.unwrap();
     assert_eq!(seq, 3);
-    assert_eq!(payload, [0xfe, 0, 0, 0, 0]);
+    assert_eq!(payload, [0xfe, 0, 0, 2, 0]); // current AUTOCOMMIT status
 }
 
 #[tokio::test]
@@ -1267,6 +1481,54 @@ async fn command_phase_rejects_nonzero_initial_sequence() {
 
     let err = server.await.unwrap().unwrap_err();
     assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+}
+
+#[tokio::test]
+async fn malformed_temporal_execute_returns_error_then_recovers() {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let (mut client, server) = start_wire_server(WireShim {
+            auth_plugin: opensrv_mysql::MYSQL_NATIVE_PASSWORD,
+        })
+        .await;
+        read_wire_packet(&mut client).await.unwrap();
+        write_wire_packet(
+            &mut client,
+            1,
+            &handshake_response(opensrv_mysql::MYSQL_NATIVE_PASSWORD, None),
+        )
+        .await
+        .unwrap();
+        read_wire_packet(&mut client).await.unwrap();
+        prepare_wire_statement(&mut client).await;
+        for ty in [
+            myc::constants::ColumnType::MYSQL_TYPE_DATE,
+            myc::constants::ColumnType::MYSQL_TYPE_DATETIME,
+            myc::constants::ColumnType::MYSQL_TYPE_TIMESTAMP,
+            myc::constants::ColumnType::MYSQL_TYPE_TIME,
+        ] {
+            for (declared, actual) in [(1u8, 1usize), (5, 5), (255, 255), (12, 3)] {
+                let mut request = vec![
+                    0x17, 42, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, ty as u8, 0, declared,
+                ];
+                request.extend(std::iter::repeat_n(0, actual));
+                write_wire_packet(&mut client, 0, &request).await.unwrap();
+                assert_execute_error(&mut client, ErrorKind::ER_MALFORMED_PACKET).await;
+                write_wire_packet(&mut client, 0, b"\x0e").await.unwrap();
+                assert_eq!(read_wire_packet(&mut client).await.unwrap().1[0], 0);
+                // WireShim returns OK on execute; an ERR above proves the malformed
+                // value did not reach that callback. A valid zero value now succeeds.
+                let request = [0x17, 42, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, ty as u8, 0, 0];
+                write_wire_packet(&mut client, 0, &request).await.unwrap();
+                let (seq, packet) = read_wire_packet(&mut client).await.unwrap();
+                assert_eq!(seq, 1);
+                assert_eq!(packet[0], 0);
+            }
+        }
+        write_wire_packet(&mut client, 0, b"\x01").await.unwrap();
+        server.await.unwrap().unwrap();
+    })
+    .await
+    .unwrap();
 }
 
 #[tokio::test]
@@ -1390,7 +1652,7 @@ async fn field_list_empty_response_is_eof_even_with_deprecate_eof() {
         .unwrap();
     let (seq, payload) = read_wire_packet(&mut client).await.unwrap();
     assert_eq!(seq, 1);
-    assert_eq!(payload, [0xfe, 0, 0, 0, 0]);
+    assert_eq!(payload, [0xfe, 0, 0, 2, 0]); // current AUTOCOMMIT status
 
     write_wire_packet(&mut client, 0, b"\x01").await.unwrap();
     drop(client);

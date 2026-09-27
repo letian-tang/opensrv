@@ -6,6 +6,49 @@ The format is based on [Keep a Changelog](http://keepachangelog.com/en/1.0.0/)
 and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.html).
 
 <!-- insertion marker -->
+## Unreleased
+
+- Run independent Connector/J 8.4.0 and 9.7.0 regression suites with checked runtime
+  driver versions and separate reports. Require correct negative binary TIME values
+  on 9.7.0, while preserving an explicitly named legacy 8.4.0 defect characterization.
+- Expand negative TIME coverage to sub-hour/sub-second values, NULL and range bounds;
+  also characterize 8.4.0's text-path sign loss for zero hours and formatting difference.
+- Reject reserved length-encoded authentication markers and malformed temporal
+  parameter lengths before backend callbacks; retain MySQL 8's 13-byte datetime
+  with timezone displacement and reject lengths that overflow the host usize.
+- Validate chrono years and leap seconds before encoding, and reject invalid
+  datetime fractions during conversion instead of creating a chrono leap second.
+- Encode signed mysql_common TIME values in text and binary, and use column-aware
+  text encoding so DATE values do not unexpectedly include a DATETIME suffix.
+- Reject nonzero microseconds at the TIME range endpoints (±838:59:59), matching
+  MySQL 8; retain Duration's existing sub-microsecond truncation.
+- Reject no_more_results without any result/OK response, including backends that
+  discard the error, so clients cannot hang behind a false completion marker.
+- Add deterministic fragmented/truncated/failing I/O, stalled-flush and parameter
+  type/NULL/long-data/rebinding matrices.
+- Extend real-driver temporal/NULL-rebinding regressions and explicitly characterize
+  Connector/J 8.4.0's incorrect negative binary TIME decoding (not a compatibility pass).
+- Add explicit zero-status response APIs and preserve durable session flags across
+  query, prepared execution, metadata, PING and database initialization; restore
+  initial flags after a successful connection reset.
+- Add optional column collation/decimals metadata for query and prepared responses,
+  preserving existing Column literals and legacy inference. Advertise CLIENT_LONG_FLAG
+  so Connector/J reads two-byte column flags and decimals at the correct offsets.
+- Avoid AuthSwitch for clients without CLIENT_PLUGIN_AUTH; accept implicit native
+  authentication with SECURE_CONNECTION and explicitly reject unsupported modes.
+- Extend raw plaintext/TLS and JDBC regressions for authentication capabilities,
+  transaction status/actual COMMIT, binary-collation text and DECIMAL scale.
+- Reuse small packet-builder allocations after successful sends, retaining at
+  most 64 KiB of capacity; release oversized buffers and buffers from failed sends.
+- Share protocol I/O configuration across greeting, plain, and TLS paths without
+  changing transport buffering, defaults, public interfaces, or flush behavior.
+- Reject missing capability-selected database/auth-plugin fields in client
+  handshakes with ER_MALFORMED_PACKET before invoking backend callbacks.
+- Accept only known UTF-8 client/server handshake collations; non-UTF-8 clients
+  now fail explicitly instead of connecting with an unsupported wire encoding.
+- Add plaintext and encrypted handshake regressions and an independent
+  Connector/J 8.4.0 suite, including 500 concurrent readers and large rows.
+
 ## [v0.7.0](https://github.com/datafuselabs/opensrv/releases/tag/v0.7.0) - 2024-02-21
 
 <small>[Compare with v0.6.0](https://github.com/datafuselabs/opensrv/compare/v0.6.0...v0.7.0)</small>
@@ -98,4 +141,3 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
 ### Code Refactoring
 
 - make auth_plugin_for_username async (#15) ([4e447f8](https://github.com/datafuselabs/opensrv/commit/4e447f8e64619b78c84c2c10f87574b1ae64a5ca) by Yang Xiufeng).
-

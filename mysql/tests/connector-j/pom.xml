@@ -1,0 +1,30 @@
+<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+  <groupId>org.opensrv</groupId><artifactId>connector-j-regression</artifactId><version>1.0-SNAPSHOT</version>
+  <properties>
+    <maven.compiler.release>17</maven.compiler.release>
+    <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+    <connector-j.version>8.4.0</connector-j.version>
+    <connector-j.test>ConnectorJ840Test</connector-j.test>
+  </properties>
+  <dependencies>
+    <dependency><groupId>com.mysql</groupId><artifactId>mysql-connector-j</artifactId><version>${connector-j.version}</version><scope>test</scope></dependency>
+    <dependency><groupId>org.junit.jupiter</groupId><artifactId>junit-jupiter</artifactId><version>5.10.2</version><scope>test</scope></dependency>
+    <dependency><groupId>com.zaxxer</groupId><artifactId>HikariCP</artifactId><version>5.1.0</version><scope>test</scope></dependency>
+    <dependency><groupId>org.slf4j</groupId><artifactId>slf4j-simple</artifactId><version>1.7.36</version><scope>test</scope></dependency>
+  </dependencies>
+  <build>
+    <directory>${project.basedir}/target/connector-j-${connector-j.version}</directory>
+    <plugins>
+    <plugin><groupId>org.apache.maven.plugins</groupId><artifactId>maven-compiler-plugin</artifactId><version>3.13.0</version></plugin>
+    <plugin><groupId>org.apache.maven.plugins</groupId><artifactId>maven-surefire-plugin</artifactId><version>3.2.5</version>
+      <configuration>
+        <argLine>-Xmx1g -Xss256k</argLine>
+        <forkedProcessTimeoutInSeconds>240</forkedProcessTimeoutInSeconds>
+        <includes><include>**/${connector-j.test}.java</include></includes>
+        <systemPropertyVariables><opensrv.connectorJVersion>${connector-j.version}</opensrv.connectorJVersion></systemPropertyVariables>
+        <failIfNoTests>true</failIfNoTests>
+      </configuration>
+    </plugin>
+  </plugins></build>
+</project>

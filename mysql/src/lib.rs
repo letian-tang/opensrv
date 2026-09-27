@@ -27,7 +27,7 @@ extern crate mysql_common as myc;
 use std::collections::HashMap;
 use std::io;
 use std::io::Write;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -82,6 +82,46 @@ pub struct Column {
     pub colflags: ColumnFlags,
 }
 
+/// Optional wire metadata for a column, independent of its value encoding.
+/// Used by [`QueryResultWriter::start_with_metadata`] and
+/// [`StatementMetaWriter::reply_with_metadata`]. Existing `Column` literals remain valid.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ColumnMetadata {
+    /// MySQL collation ID. `None` preserves the legacy type/flag inference.
+    /// Explicit IDs must describe UTF-8 text or binary (63). For example, use
+    /// 46 for utf8mb4_bin text even when `BINARY_FLAG` is set, and 63 for bytes.
+    pub collation: Option<u16>,
+    /// Decimal scale / temporal fractional precision; 31 means unspecified
+    /// precision (e.g. floating point). Defaults to zero.
+    pub decimals: u8,
+}
+
+impl ColumnMetadata {
+    pub(crate) fn validate(self) -> io::Result<()> {
+        if let Some(id) = self.collation.filter(|id| *id != 63) {
+            validate_collation(id)
+                .map_err(|(_, message)| io::Error::new(io::ErrorKind::InvalidInput, message))?;
+        }
+        if self.decimals > 31 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "column decimals exceeds 31",
+            ));
+        }
+        Ok(())
+    }
+}
+
+// Only durable session state carries over to the next response. In particular,
+// MORE_RESULTS, warning/optimizer indicators and SESSION_STATE_CHANGED do not.
+fn session_status_flags(flags: StatusFlags) -> StatusFlags {
+    flags
+        & (StatusFlags::SERVER_STATUS_IN_TRANS
+            | StatusFlags::SERVER_STATUS_AUTOCOMMIT
+            | StatusFlags::SERVER_STATUS_NO_BACKSLASH_ESCAPES
+            | StatusFlags::SERVER_STATUS_IN_TRANS_READONLY)
+}
+
 /// QueryStatusInfo represents the status of a query.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct OkResponse {
@@ -91,7 +131,9 @@ pub struct OkResponse {
     pub affected_rows: u64,
     /// insert_id in update/insert
     pub last_insert_id: u64,
-    /// StatusFlags associated with this query
+    /// StatusFlags associated with this query. `completed` / `complete_one`
+    /// retain the legacy empty-means-inherit behavior; use `completed_with_status`
+    /// / `complete_one_with_status` to send an explicit zero status.
     pub status_flags: StatusFlags,
     /// Warnings
     pub warnings: u16,
@@ -137,6 +179,29 @@ fn ensure_response_completed(completion: &Arc<AtomicBool>, command: &str) -> io:
             io::ErrorKind::InvalidData,
             format!("backend returned without completing {command} response"),
         ))
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+enum InitResponse {
+    Pending,
+    Ok,
+    Error,
+}
+
+fn init_response(completion: &Arc<AtomicU8>, command: &str) -> io::Result<InitResponse> {
+    match completion.load(Ordering::Acquire) {
+        value if value == InitResponse::Ok as u8 => Ok(InitResponse::Ok),
+        value if value == InitResponse::Error as u8 => Ok(InitResponse::Error),
+        value if value == InitResponse::Pending as u8 => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("backend returned without completing {command} response"),
+        )),
+        value => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("backend returned invalid {command} response state {value}"),
+        )),
     }
 }
 
@@ -325,15 +390,22 @@ pub trait AsyncMysqlShim<W: Send> {
         let q = query.to_lowercase();
         let var = &q["select @@".len()..];
         if var == "max_allowed_packet" {
+            let max_packet_size =
+                u64::try_from(results.writer.max_packet_size()).map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "configured max_packet_size cannot be represented as u64",
+                    )
+                })?;
             let cols = &[Column {
                 table: String::new(),
                 column: "@@max_allowed_packet".to_string(),
                 collen: 0,
-                coltype: myc::constants::ColumnType::MYSQL_TYPE_LONG,
+                coltype: myc::constants::ColumnType::MYSQL_TYPE_LONGLONG,
                 colflags: myc::constants::ColumnFlags::UNSIGNED_FLAG,
             }];
             let mut w = results.start(cols).await?;
-            w.write_row(std::iter::once(67108864u32)).await?;
+            w.write_row(std::iter::once(max_packet_size)).await?;
             w.finish().await?;
         } else {
             self.on_query(query, results).await?;
@@ -380,9 +452,12 @@ pub struct IntermediaryOptions {
     pub max_prepared_statements: Option<usize>,
     /// Aggregate `COM_STMT_SEND_LONG_DATA` bytes retained by one connection.
     pub max_connection_long_data_size: Option<usize>,
-    /// Status flags advertised in the initial handshake.
+    /// Status flags advertised in the initial handshake and restored after a
+    /// successful COM_RESET_CONNECTION. The backend must reset to matching state.
     pub initial_status_flags: StatusFlags,
     /// Character set/collation advertised in the initial handshake.
+    /// Must identify a known utf8mb3/utf8mb4 collation; other values fail before
+    /// the greeting is sent. This does not configure backend SQL sorting rules.
     pub initial_collation: u8,
     /// Advertise and enforce support for multiple result sets.
     pub enable_multi_results: bool,
@@ -409,6 +484,28 @@ impl Default for IntermediaryOptions {
     }
 }
 
+impl IntermediaryOptions {
+    fn packet_size_limit(&self) -> usize {
+        self.max_packet_size.unwrap_or(DEFAULT_MAX_PACKET_SIZE)
+    }
+
+    // Shared by greeting, plain, and TLS paths. These helpers configure only
+    // protocol I/O; the caller still owns its transport and buffering choices.
+    fn packet_reader<R>(&self, input_stream: R) -> PacketReader<R> {
+        PacketReader::new_with_max_packet_size(input_stream, self.packet_size_limit())
+    }
+
+    fn packet_writer<W>(&self, output_stream: W) -> PacketWriter<W> {
+        let mut writer = PacketWriter::new(output_stream);
+        if let Some(threshold) = self.write_high_watermark {
+            writer.set_flush_threshold(threshold);
+        }
+        writer.set_max_packet_size(self.packet_size_limit());
+        writer.set_write_timeout(self.write_timeout);
+        writer
+    }
+}
+
 #[derive(Default)]
 struct StatementData {
     long_data: HashMap<u16, Vec<u8>>,
@@ -418,6 +515,52 @@ struct StatementData {
 }
 
 const AUTH_PLUGIN_DATA_PART_1_LENGTH: usize = 8;
+
+fn validate_collation(id: u16) -> Result<(), (ErrorKind, String)> {
+    use myc::collations::{Collation, CollationId};
+    let collation_id = CollationId::from(id);
+    if collation_id == CollationId::UNKNOWN_COLLATION_ID {
+        return Err((
+            ErrorKind::ER_UNKNOWN_COLLATION,
+            format!("unknown collation id {id}"),
+        ));
+    }
+    let collation = Collation::from(collation_id);
+    if matches!(collation.charset(), "utf8mb3" | "utf8mb4") {
+        Ok(())
+    } else {
+        Err((
+            ErrorKind::ER_UNKNOWN_CHARACTER_SET,
+            format!(
+                "unsupported client character set {}; opensrv requires UTF-8",
+                collation.charset()
+            ),
+        ))
+    }
+}
+
+async fn parse_client_handshake<W: AsyncWrite + Unpin>(
+    payload: &[u8],
+    after_tls: bool,
+    writer: &mut PacketWriter<W>,
+) -> io::Result<ClientHandshake> {
+    match commands::client_handshake(payload, after_tls) {
+        Ok((_, handshake)) => Ok(handshake),
+        Err(_) => {
+            writers::write_err(
+                ErrorKind::ER_MALFORMED_PACKET,
+                b"malformed client handshake",
+                writer,
+            )
+            .await?;
+            writer.flush_all().await?;
+            Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "malformed client handshake",
+            ))
+        }
+    }
+}
 
 /// A server that speaks the MySQL/MariaDB protocol, and can delegate client commands to a backend
 /// that implements [`AsyncMysqlShim`](trait.AsyncMysqlShim.html).
@@ -431,6 +574,7 @@ pub struct AsyncMysqlIntermediary<B, S: AsyncRead + Unpin, W> {
     max_connection_long_data_size: usize,
     max_prepared_statements: usize,
     status_flags: StatusFlags,
+    initial_status_flags: StatusFlags,
     shim: B,
     reader: packet_reader::PacketReader<S>,
     writer: packet_writer::PacketWriter<W>,
@@ -467,7 +611,7 @@ where
     ) -> Result<(), B::Error> {
         let process_use_statement_on_query = opts.process_use_statement_on_query;
         let reject_connection_on_dbname_absence = opts.reject_connection_on_dbname_absence;
-        let max_long_data_size = opts.max_packet_size.unwrap_or(DEFAULT_MAX_PACKET_SIZE);
+        let max_long_data_size = opts.packet_size_limit();
         let max_connection_long_data_size = opts
             .max_connection_long_data_size
             .unwrap_or(max_long_data_size);
@@ -483,14 +627,8 @@ where
             )
             .await?;
 
-        let reader = PacketReader::new_with_max_packet_size(
-            input_stream,
-            opts.max_packet_size.unwrap_or(DEFAULT_MAX_PACKET_SIZE),
-        );
-        let mut writer = PacketWriter::new(output_stream);
-        writer.set_flush_threshold(opts.write_high_watermark.unwrap_or(64 * 1024));
-        writer.set_max_packet_size(opts.max_packet_size.unwrap_or(DEFAULT_MAX_PACKET_SIZE));
-        writer.set_write_timeout(opts.write_timeout);
+        let reader = opts.packet_reader(input_stream);
+        let writer = opts.packet_writer(output_stream);
 
         let mut mi = AsyncMysqlIntermediary {
             client_capabilities,
@@ -502,6 +640,7 @@ where
             max_connection_long_data_size,
             max_prepared_statements,
             status_flags: opts.initial_status_flags,
+            initial_status_flags: opts.initial_status_flags,
             shim,
             reader,
             writer,
@@ -601,14 +740,10 @@ where
                 "authentication challenge contains a protocol delimiter",
             ));
         }
-        let mut reader = PacketReader::new_with_max_packet_size(
-            input_stream,
-            opts.max_packet_size.unwrap_or(DEFAULT_MAX_PACKET_SIZE),
-        );
-        let mut writer = PacketWriter::new(output_stream);
-        writer.set_flush_threshold(opts.write_high_watermark.unwrap_or(64 * 1024));
-        writer.set_max_packet_size(opts.max_packet_size.unwrap_or(DEFAULT_MAX_PACKET_SIZE));
-        writer.set_write_timeout(opts.write_timeout);
+        validate_collation(u16::from(opts.initial_collation))
+            .map_err(|(_, message)| io::Error::new(io::ErrorKind::InvalidInput, message))?;
+        let mut reader = opts.packet_reader(input_stream);
+        let mut writer = opts.packet_writer(output_stream);
         // https://dev.mysql.com/doc/internals/en/connection-phase-packets.html#packet-Protocol::HandshakeV10
         writer.write_all(&[10])?; // protocol 10
 
@@ -619,6 +754,9 @@ where
         writer.write_all(&config.connection_id.to_le_bytes())?;
 
         let mut server_capabilities = CapabilityFlags::CLIENT_PROTOCOL_41
+            // ColumnDefinition41 writes two-byte flags. Connector/J uses this
+            // capability to locate the following decimals byte correctly.
+            | CapabilityFlags::CLIENT_LONG_FLAG
             | CapabilityFlags::CLIENT_SECURE_CONNECTION
             | CapabilityFlags::CLIENT_PLUGIN_AUTH
             | CapabilityFlags::CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA
@@ -685,33 +823,8 @@ where
                 "unexpected initial handshake sequence",
             ));
         }
-        let mut handshake = commands::client_handshake(&handshake, false)
-            .map_err(|e| match e {
-                nom::Err::Incomplete(_) => io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "client sent incomplete handshake",
-                ),
-                nom::Err::Failure(nom_error) | nom::Err::Error(nom_error) => {
-                    if let nom::error::ErrorKind::Eof = nom_error.code {
-                        io::Error::new(
-                            io::ErrorKind::UnexpectedEof,
-                            format!(
-                                "client did not complete handshake; got {:?}",
-                                nom_error.input
-                            ),
-                        )
-                    } else {
-                        io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            format!(
-                                "bad client handshake; got {:?} ({:?})",
-                                nom_error.input, nom_error.code
-                            ),
-                        )
-                    }
-                }
-            })?
-            .1;
+        writer.set_seq(seq.wrapping_add(1));
+        let mut handshake = parse_client_handshake(&handshake, false, &mut writer).await?;
 
         handshake.server_scramble = Some(config.scramble);
         writer.set_seq(seq.wrapping_add(1));
@@ -721,8 +834,7 @@ where
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "client requested SSL despite us not advertising support for it",
-            )
-            .into());
+            ));
         }
 
         #[cfg(feature = "tls")]
@@ -764,33 +876,8 @@ where
             }
             seq = _seq;
 
-            handshake = commands::client_handshake(&hs, true)
-                .map_err(|e| match e {
-                    nom::Err::Incomplete(_) => io::Error::new(
-                        io::ErrorKind::UnexpectedEof,
-                        "client sent incomplete handshake",
-                    ),
-                    nom::Err::Failure(nom_error) | nom::Err::Error(nom_error) => {
-                        if let nom::error::ErrorKind::Eof = nom_error.code {
-                            io::Error::new(
-                                io::ErrorKind::UnexpectedEof,
-                                format!(
-                                    "client did not complete handshake; got {:?}",
-                                    nom_error.input
-                                ),
-                            )
-                        } else {
-                            io::Error::new(
-                                io::ErrorKind::InvalidData,
-                                format!(
-                                    "bad client handshake; got {:?} ({:?})",
-                                    nom_error.input, nom_error.code
-                                ),
-                            )
-                        }
-                    }
-                })?
-                .1;
+            self.writer.set_seq(seq.wrapping_add(1));
+            handshake = parse_client_handshake(&hs, true, &mut self.writer).await?;
 
             self.writer.set_seq(seq.wrapping_add(1));
         }
@@ -808,12 +895,47 @@ where
             }
 
             self.client_capabilities &= handshake.capabilities;
+            self.writer.set_seq(seq.wrapping_add(1));
+            if let Err((kind, message)) = validate_collation(handshake.collation) {
+                writers::write_err(kind, message.as_bytes(), &mut self.writer).await?;
+                self.writer.flush_all().await?;
+                return Err(io::Error::new(io::ErrorKind::InvalidData, message).into());
+            }
             let mut auth_response = handshake.auth_response.clone();
             if let Some(username) = &handshake.username {
                 let auth_plugin_expect = self.shim.auth_plugin_for_username(username).await;
 
+                let plugin_auth = self
+                    .client_capabilities
+                    .contains(CapabilityFlags::CLIENT_PLUGIN_AUTH);
+                if !plugin_auth {
+                    // Protocol 4.1 clients without plugin negotiation use native
+                    // password only when SECURE_CONNECTION is present. Never send
+                    // an AuthSwitchRequest to a client unable to understand it.
+                    if !self
+                        .client_capabilities
+                        .contains(CapabilityFlags::CLIENT_SECURE_CONNECTION)
+                        || (!auth_plugin_expect.is_empty()
+                            && auth_plugin_expect != MYSQL_NATIVE_PASSWORD)
+                    {
+                        writers::write_err(
+                            ErrorKind::ER_NOT_SUPPORTED_AUTH_MODE,
+                            b"client does not support the required authentication protocol",
+                            &mut self.writer,
+                        )
+                        .await?;
+                        self.writer.flush_all().await?;
+                        return Err(io::Error::new(
+                            io::ErrorKind::PermissionDenied,
+                            "unsupported client authentication protocol",
+                        )
+                        .into());
+                    }
+                }
+
                 // auth switch
-                if !auth_plugin_expect.is_empty()
+                if plugin_auth
+                    && !auth_plugin_expect.is_empty()
                     && handshake.auth_plugin != auth_plugin_expect.as_bytes()
                 {
                     self.writer.set_seq(seq.wrapping_add(1));
@@ -865,7 +987,7 @@ where
                         auth_plugin_expect,
                     );
                     writers::write_err(
-                        ErrorKind::ER_ACCESS_DENIED_NO_PASSWORD_ERROR,
+                        ErrorKind::ER_ACCESS_DENIED_ERROR,
                         err_msg.as_bytes(),
                         &mut self.writer,
                     )
@@ -890,7 +1012,7 @@ where
                         auth_plugin_expect,
                     );
                     writers::write_err(
-                        ErrorKind::ER_ACCESS_DENIED_NO_PASSWORD_ERROR,
+                        ErrorKind::ER_ACCESS_DENIED_ERROR,
                         err_msg.as_bytes(),
                         &mut self.writer,
                     )
@@ -929,15 +1051,20 @@ where
                         }
                     };
                     {
-                        let completion = Arc::new(AtomicBool::new(false));
-                        let w = InitWriter {
-                            client_capabilities: self.client_capabilities,
-                            status_flags: self.status_flags,
-                            writer: &mut self.writer,
-                            completion: Arc::clone(&completion),
-                        };
+                        let (w, completion) = InitWriter::new_tracked(
+                            &mut self.writer,
+                            self.client_capabilities,
+                            &mut self.status_flags,
+                        );
                         self.shim.on_init(db, w).await?;
-                        ensure_response_completed(&completion, "initial database")?;
+                        if init_response(&completion, "initial database")? == InitResponse::Error {
+                            self.writer.flush_all().await?;
+                            return Err(io::Error::new(
+                                io::ErrorKind::ConnectionAborted,
+                                "initial database was rejected by the backend",
+                            )
+                            .into());
+                        }
                         needs_default_ok = false;
                     }
                 } else if self.reject_connection_on_dbname_absence {
@@ -1021,30 +1148,28 @@ where
                                     &mut self.writer,
                                     false,
                                     self.client_capabilities,
-                                    self.status_flags,
+                                    &mut self.status_flags,
                                 );
                                 self.shim.on_system_variable(q_str, w).await?;
                                 ensure_response_completed(&completion, "query")?;
                             } else if !self.process_use_statement_on_query
                                 && (q_str.starts_with("USE ") || q_str.starts_with("use "))
                             {
-                                let completion = Arc::new(AtomicBool::new(false));
-                                let w = InitWriter {
-                                    client_capabilities: self.client_capabilities,
-                                    status_flags: self.status_flags,
-                                    writer: &mut self.writer,
-                                    completion: Arc::clone(&completion),
-                                };
+                                let (w, completion) = InitWriter::new_tracked(
+                                    &mut self.writer,
+                                    self.client_capabilities,
+                                    &mut self.status_flags,
+                                );
                                 let schema = &q_str["USE ".len()..];
                                 let schema = schema.trim().trim_end_matches(';').trim_matches('`');
                                 self.shim.on_init(schema, w).await?;
-                                ensure_response_completed(&completion, "USE")?;
+                                init_response(&completion, "USE")?;
                             } else {
                                 let (w, completion) = QueryResultWriter::new_tracked(
                                     &mut self.writer,
                                     false,
                                     self.client_capabilities,
-                                    self.status_flags,
+                                    &mut self.status_flags,
                                 );
                                 self.shim.on_query(q_str, w).await?;
                                 ensure_response_completed(&completion, "query")?;
@@ -1084,6 +1209,7 @@ where
                                 writer: &mut self.writer,
                                 stmts: &mut stmts,
                                 client_capabilities: self.client_capabilities,
+                                status_flags: self.status_flags,
                                 completion: Arc::clone(&completion),
                             };
 
@@ -1158,7 +1284,7 @@ where
                                     &mut self.writer,
                                     true,
                                     self.client_capabilities,
-                                    self.status_flags,
+                                    &mut self.status_flags,
                                 );
                                 self.shim.on_execute(stmt, params, w).await?;
                                 ensure_response_completed(&completion, "execute")?;
@@ -1268,8 +1394,7 @@ where
                             // The mysql command line tool issues one of these commands after switching databases with USE <DB>.
                             // An empty COM_FIELD_LIST response is closed by a real EOF
                             // packet, even when the client negotiated CLIENT_DEPRECATE_EOF.
-                            writers::write_eof_packet(&mut self.writer, StatusFlags::empty())
-                                .await?;
+                            writers::write_eof_packet(&mut self.writer, self.status_flags).await?;
                         }
                         Command::Init(schema) => {
                             let schema_str = match ::std::str::from_utf8(schema) {
@@ -1285,15 +1410,13 @@ where
                                     continue;
                                 }
                             };
-                            let completion = Arc::new(AtomicBool::new(false));
-                            let w = InitWriter {
-                                client_capabilities: self.client_capabilities,
-                                status_flags: self.status_flags,
-                                writer: &mut self.writer,
-                                completion: Arc::clone(&completion),
-                            };
+                            let (w, completion) = InitWriter::new_tracked(
+                                &mut self.writer,
+                                self.client_capabilities,
+                                &mut self.status_flags,
+                            );
                             self.shim.on_init(schema_str, w).await?;
-                            ensure_response_completed(&completion, "init database")?;
+                            init_response(&completion, "init database")?;
                         }
                         Command::Ping => {
                             writers::write_ok_packet(
@@ -1310,6 +1433,7 @@ where
                             if self.shim.on_reset_connection().await? {
                                 stmts.clear();
                                 total_long_data_size = 0;
+                                self.status_flags = self.initial_status_flags;
                                 writers::write_ok_packet(
                                     &mut self.writer,
                                     self.client_capabilities,

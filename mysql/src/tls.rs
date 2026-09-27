@@ -25,7 +25,6 @@ use tokio_rustls::{rustls::ServerConfig, TlsAcceptor};
 use crate::commands::ClientHandshake;
 use crate::myc::constants::CapabilityFlags;
 use crate::packet_reader::PacketReader;
-use crate::packet_writer::PacketWriter;
 use crate::{AsyncMysqlIntermediary, AsyncMysqlShim, IntermediaryOptions};
 
 pub async fn plain_run_with_options<B, R, W>(
@@ -40,24 +39,12 @@ where
     W: AsyncWrite + Send + Unpin,
 {
     let (handshake, seq, client_capabilities, reader) = init_params;
-    let reader = PacketReader::new_with_max_packet_size(
-        reader,
-        opts.max_packet_size
-            .unwrap_or(crate::packet_reader::DEFAULT_MAX_PACKET_SIZE),
-    );
-    let mut writer = PacketWriter::new(writer);
-    writer.set_flush_threshold(opts.write_high_watermark.unwrap_or(64 * 1024));
-    writer.set_max_packet_size(
-        opts.max_packet_size
-            .unwrap_or(crate::packet_reader::DEFAULT_MAX_PACKET_SIZE),
-    );
-    writer.set_write_timeout(opts.write_timeout);
+    let reader = opts.packet_reader(reader);
+    let writer = opts.packet_writer(writer);
 
     let process_use_statement_on_query = opts.process_use_statement_on_query;
     let reject_connection_on_dbname_absence = opts.reject_connection_on_dbname_absence;
-    let max_long_data_size = opts
-        .max_packet_size
-        .unwrap_or(crate::packet_reader::DEFAULT_MAX_PACKET_SIZE);
+    let max_long_data_size = opts.packet_size_limit();
     let max_connection_long_data_size = opts
         .max_connection_long_data_size
         .unwrap_or(max_long_data_size);
@@ -72,6 +59,7 @@ where
         max_connection_long_data_size,
         max_prepared_statements,
         status_flags: opts.initial_status_flags,
+        initial_status_flags: opts.initial_status_flags,
         shim,
         reader,
         writer,
@@ -103,24 +91,12 @@ where
     } else {
         negotiation.await?
     };
-    let reader = PacketReader::new_with_max_packet_size(
-        reader,
-        opts.max_packet_size
-            .unwrap_or(crate::packet_reader::DEFAULT_MAX_PACKET_SIZE),
-    );
-    let mut writer = PacketWriter::new(writer);
-    writer.set_flush_threshold(opts.write_high_watermark.unwrap_or(64 * 1024));
-    writer.set_max_packet_size(
-        opts.max_packet_size
-            .unwrap_or(crate::packet_reader::DEFAULT_MAX_PACKET_SIZE),
-    );
-    writer.set_write_timeout(opts.write_timeout);
+    let reader = opts.packet_reader(reader);
+    let writer = opts.packet_writer(writer);
 
     let process_use_statement_on_query = opts.process_use_statement_on_query;
     let reject_connection_on_dbname_absence = opts.reject_connection_on_dbname_absence;
-    let max_long_data_size = opts
-        .max_packet_size
-        .unwrap_or(crate::packet_reader::DEFAULT_MAX_PACKET_SIZE);
+    let max_long_data_size = opts.packet_size_limit();
     let max_connection_long_data_size = opts
         .max_connection_long_data_size
         .unwrap_or(max_long_data_size);
@@ -135,6 +111,7 @@ where
         max_connection_long_data_size,
         max_prepared_statements,
         status_flags: opts.initial_status_flags,
+        initial_status_flags: opts.initial_status_flags,
         shim,
         reader,
         writer,
