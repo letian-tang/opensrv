@@ -145,7 +145,10 @@ pub struct OkResponse {
 
 pub use crate::errorcodes::ErrorKind;
 pub use crate::params::{ParamParser, ParamValue, Params};
-pub use crate::resultset::{InitWriter, QueryResultWriter, RowWriter, StatementMetaWriter};
+pub use crate::resultset::{
+    CursorExecuteWriter, CursorFetchWriter, InitWriter, QueryResultWriter, RowWriter,
+    StatementMetaWriter,
+};
 pub use crate::value::{decode::to_naive_datetime, ToMysqlValue, Value, ValueInner};
 use crate::{
     commands::ClientHandshake,
@@ -164,8 +167,11 @@ pub fn generate_scramble() -> io::Result<[u8; SCRAMBLE_SIZE]> {
     let mut scramble = [0; SCRAMBLE_SIZE];
     getrandom::fill(&mut scramble).map_err(io::Error::other)?;
     for byte in &mut scramble {
-        if *byte == b'\0' || *byte == b'$' {
-            *byte = byte.wrapping_add(1);
+        // MySQL generate_user_salt uses ASCII. Connector/J decodes the initial
+        // seed as ASCII before handing it to authentication plugins. Rejection
+        // sampling keeps the allowed alphabet uniform and propagates RNG errors.
+        while !byte.is_ascii() || matches!(*byte, 0 | b'$') {
+            getrandom::fill(std::slice::from_mut(byte)).map_err(io::Error::other)?;
         }
     }
     Ok(scramble)
@@ -224,6 +230,7 @@ fn command_parse_error(packet: &[u8]) -> (ErrorKind, String) {
                 || x == CommandByte::COM_STMT_SEND_LONG_DATA as u8
                 || x == CommandByte::COM_STMT_CLOSE as u8
                 || x == CommandByte::COM_STMT_RESET as u8
+                || x == CommandByte::COM_STMT_FETCH as u8
                 || x == CommandByte::COM_RESET_CONNECTION as u8
                 || x == CommandByte::COM_QUIT as u8
                 || x == CommandByte::COM_PING as u8
@@ -348,6 +355,45 @@ pub trait AsyncMysqlShim<W: Send> {
         params: ParamParser<'a>,
         results: QueryResultWriter<'a, W>,
     ) -> Result<(), Self::Error>;
+
+    /// Optional read-only server cursor execution. The default rejects it.
+    async fn on_execute_cursor<'a>(
+        &'a mut self,
+        _id: u32,
+        _params: ParamParser<'a>,
+        results: CursorExecuteWriter<'a, W>,
+    ) -> Result<(), Self::Error>
+    where
+        W: AsyncWrite + Unpin,
+    {
+        results
+            .error(
+                ErrorKind::ER_UNSUPPORTED_PS,
+                b"backend does not support cursors",
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Read at most `rows` rows from an existing cursor (zero must not advance).
+    async fn on_fetch<'a>(
+        &'a mut self,
+        _id: u32,
+        _rows: u32,
+        results: CursorFetchWriter<'a, W>,
+    ) -> Result<(), Self::Error>
+    where
+        W: AsyncWrite + Unpin,
+    {
+        results
+            .error(ErrorKind::ER_STMT_HAS_NO_OPEN_CURSOR, b"no open cursor")
+            .await?;
+        Ok(())
+    }
+
+    /// Release a cursor, not its prepared statement. Must be idempotent.
+    /// Backends must also use RAII for disconnect/cancellation cleanup.
+    async fn on_close_cursor(&mut self, _id: u32) {}
 
     /// Called when the client wishes to deallocate resources associated with a previously prepared
     /// statement.
@@ -508,6 +554,7 @@ impl IntermediaryOptions {
 
 #[derive(Default)]
 struct StatementData {
+    cursor_columns: Option<Vec<Column>>,
     long_data: HashMap<u16, Vec<u8>>,
     bound_types: Vec<(myc::constants::ColumnType, bool)>,
     params: u16,
@@ -1222,7 +1269,7 @@ where
                             iteration_count,
                             params,
                         } => {
-                            if flags != 0 || iteration_count != 1 {
+                            if flags > 1 || iteration_count != 1 {
                                 writers::write_err(
                                     ErrorKind::ER_UNSUPPORTED_PS,
                                     format!(
@@ -1249,6 +1296,8 @@ where
                                     continue;
                                 }
                             };
+                            self.shim.on_close_cursor(stmt).await;
+                            state.cursor_columns = None;
                             let retained_long_data = state
                                 .long_data
                                 .values()
@@ -1286,11 +1335,72 @@ where
                                     self.client_capabilities,
                                     &mut self.status_flags,
                                 );
-                                self.shim.on_execute(stmt, params, w).await?;
+                                let mut cursor_columns = None;
+                                if flags == 1 {
+                                    self.shim
+                                        .on_execute_cursor(
+                                            stmt,
+                                            params,
+                                            CursorExecuteWriter {
+                                                result: w,
+                                                columns: &mut cursor_columns,
+                                            },
+                                        )
+                                        .await?;
+                                } else {
+                                    self.shim.on_execute(stmt, params, w).await?;
+                                }
                                 ensure_response_completed(&completion, "execute")?;
+                                state.cursor_columns = cursor_columns;
+                                if flags == 1 && state.cursor_columns.is_none() {
+                                    self.shim.on_close_cursor(stmt).await;
+                                }
                                 state.long_data.clear();
                                 total_long_data_size =
                                     total_long_data_size.saturating_sub(retained_long_data);
+                            }
+                        }
+                        Command::Fetch { stmt, rows } => {
+                            let columns = stmts
+                                .get(&stmt)
+                                .and_then(|state| state.cursor_columns.as_ref());
+                            if let Some(columns) = columns {
+                                let mut exhausted = false;
+                                let (result, completion) = QueryResultWriter::new_tracked(
+                                    &mut self.writer,
+                                    true,
+                                    self.client_capabilities,
+                                    &mut self.status_flags,
+                                );
+                                self.shim
+                                    .on_fetch(
+                                        stmt,
+                                        rows,
+                                        CursorFetchWriter::new(
+                                            result,
+                                            columns,
+                                            rows,
+                                            &mut exhausted,
+                                        ),
+                                    )
+                                    .await?;
+                                ensure_response_completed(&completion, "fetch")?;
+                                if exhausted {
+                                    stmts.get_mut(&stmt).unwrap().cursor_columns = None;
+                                    self.shim.on_close_cursor(stmt).await;
+                                }
+                            } else {
+                                let kind = if stmts.contains_key(&stmt) {
+                                    ErrorKind::ER_STMT_HAS_NO_OPEN_CURSOR
+                                } else {
+                                    ErrorKind::ER_UNKNOWN_STMT_HANDLER
+                                };
+                                writers::write_err(
+                                    kind,
+                                    b"statement has no open cursor",
+                                    &mut self.writer,
+                                )
+                                .await?;
                             }
                         }
                         Command::SendLongData { stmt, param, data } => {
@@ -1351,6 +1461,7 @@ where
                             }
                         }
                         Command::Close(stmt) => {
+                            self.shim.on_close_cursor(stmt).await;
                             self.shim.on_close(stmt).await;
                             if let Some(state) = stmts.remove(&stmt) {
                                 let removed = state
@@ -1363,6 +1474,8 @@ where
                         }
                         Command::Reset(stmt) => {
                             if let Some(state) = stmts.get_mut(&stmt) {
+                                self.shim.on_close_cursor(stmt).await;
+                                state.cursor_columns = None;
                                 let removed = state
                                     .long_data
                                     .values()
@@ -1431,6 +1544,9 @@ where
                         }
                         Command::ResetConnection => {
                             if self.shim.on_reset_connection().await? {
+                                for id in stmts.keys() {
+                                    self.shim.on_close_cursor(*id).await;
+                                }
                                 stmts.clear();
                                 total_long_data_size = 0;
                                 self.status_flags = self.initial_status_flags;

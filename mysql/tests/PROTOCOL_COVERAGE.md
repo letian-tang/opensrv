@@ -27,7 +27,10 @@
 
 ## 明确边界及未消除的差异
 
-- 未扩展完整 caching_sha2_password/RSA/full-auth、压缩、游标、字符集转码、query attributes。
+- 未扩展完整 caching_sha2_password/RSA/full-auth、压缩、字符集转码、query attributes。
+- 游标是可选后端接口：原始包测试 `tests/it/cursor.rs` 覆盖 EOF/OK、FETCH 0、整批末尾、
+  未打开/未知游标、畸形命令、状态隔离、重复执行、关闭/重置/断连。真实执行及资源配额
+  由使用方验证；NimbusDB 的独立 JDBC 模块使用真实 DuckDB，而非 opensrv 的固定 SQL fixture。
 - 13 字节输入保留 offset，但不做 session timezone 转换；后端选择实际时间语义。
 - Connector/J 8.4.0 PING 不解析 OK 状态；事务内 PING 后依赖 useLocalTransactionState 不保证正确。
 - Connector/J 8.4.0 binary TIME 负号处理有错误。Java 中对应 characterization test
@@ -39,6 +42,12 @@
 - 未连接真实 MySQL 8 服务端运行差分测试；目前“对齐”证据来自官方 C++ 实现、固定字节断言、独立 Rust 解码和真实 Java 驱动。
 
 ## 官方依据
+
+游标配套实施的跨仓库验证由 NimbusDB `docs/JDBC_CURSOR_VALIDATION.md` 记录。
+opensrv 本轮新增的原始包测试不依赖 NimbusDB，也不把后端物化结果误称为协议层缓存。
+
+- [sql_cursor.cc](https://github.com/mysql/mysql-server/blob/mysql-8.0.46/sql/sql_cursor.cc)：
+  游标物化、FETCH 整批/末尾行为，以及在真实会话状态上叠加 CURSOR_EXISTS/LAST_ROW_SENT。
 
 - [protocol_classic.cc](https://github.com/mysql/mysql-server/blob/mysql-8.0.46/sql/protocol_classic.cc)：分帧、结果列、EOF/OK、DATE/DATETIME/TIME 的 wire 格式。
 - [net_serv.cc](https://github.com/mysql/mysql-server/blob/mysql-8.0.46/sql-common/net_serv.cc)：大包续帧、空终止帧、sequence 回环和部分 I/O。
@@ -71,3 +80,24 @@ bash mysql/tests/connector-j/run.sh -s mysql/tests/connector-j/settings-central.
   - 两套驱动各实际运行 500 个 Java 工作线程、最多 500 个连接，每线程 10 轮逐次内容校验，合计 10,000 次并发查询。
   - 运行时读取 JDBC metadata 确认实际驱动版本，报告分别位于 `connector-j/target/connector-j-8.4.0/surefire-reports` 和 `connector-j/target/connector-j-9.7.0/surefire-reports`。
 - 新发现的 TIME 端点越界和空结果错误完成标记均先由回归测试复现失败，再验证修复。
+
+## 游标实现复审（2026-09-28）
+
+- 检查命令解析、可选回调、响应完成保护、旧游标清理、结果所有权和分批发送路径。
+- 补齐两个游标 writer 的 `set_status_flags`：后端执行启动事务或读取失败回滚时，
+  能报告实际状态，不局限于继承上一命令的状态。未添加 SQL 事务推断。
+- `cursor_status_updates_include_empty_fetch_and_error_paths` 覆盖 EOF/OK 两种协商、
+  打开、FETCH 0、耗尽、执行/FETCH 错误、显式零及会话状态过滤；修复前因缺少公开
+  状态接口无法编译，补齐后按实际 wire 字节和持久状态断言通过。
+- 当前全特性 205 单测 / 67 集成测试、无默认特性 205 单测 / 61 集成测试通过；
+  两套特性 all-targets Clippy（`-D warnings`）、fmt、diff check 通过。
+
+## 0.10.6 发布前验证（2026-09-28）
+
+- 包版本统一为 0.10.6；重新运行两套特性 all-targets 测试，均为 205 单测，
+  分别 67 / 61 集成测试，另有 1 项 example 测试通过。
+- 两套特性严格 Clippy、fmt 与 diff check 通过。
+- 双版本 JDBC 脚本重新通过：8.4.0、9.7.0 各 9 项，无失败或跳过；
+  8.4.0 中两项负 TIME 限制刻画仍不算兼容通过。
+- 每套 JDBC 各运行 500 工作线程、最多 500 连接、每线程 10 轮查询。
+  游标后端的 NimbusDB 联调证据仍以其独立验证记录为准。

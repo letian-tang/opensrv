@@ -282,3 +282,21 @@ fn it_parses_handshake_response320() {
     assert_eq!(handshake.auth_response, b"secret_bytes");
     assert_eq!(handshake.db, None);
 }
+#[test]
+fn fetch_requires_exact_command_shape() {
+    use crate::commands::{parse, Command};
+    let packet = [0x1c, 7, 0, 0, 0, 255, 255, 255, 255];
+    assert_eq!(
+        parse(&packet).unwrap().1,
+        Command::Fetch {
+            stmt: 7,
+            rows: u32::MAX
+        }
+    );
+    for length in 0..packet.len() {
+        assert!(parse(&packet[..length]).is_err());
+    }
+    let mut trailing = packet.to_vec();
+    trailing.push(0);
+    assert!(parse(&trailing).is_err());
+}

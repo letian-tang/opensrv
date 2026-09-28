@@ -1,6 +1,6 @@
 [package]
 name = "opensrv-mysql"
-version = "0.10.2"
+version = "0.10.6"
 authors = ["guzai-tang@163.com"]
 edition = "2021"
 license = "Apache-2.0"

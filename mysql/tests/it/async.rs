@@ -1548,9 +1548,14 @@ async fn execute_rejects_cursor_flags_and_keeps_connection_open() {
     read_wire_packet(&mut client).await.unwrap();
     prepare_wire_statement(&mut client).await;
 
-    write_wire_packet(&mut client, 0, b"\x17\x2a\0\0\0\x01\x01\0\0\0")
-        .await
-        .unwrap();
+    // A valid NULL binding reaches the backend's default unsupported hook.
+    write_wire_packet(
+        &mut client,
+        0,
+        b"\x17\x2a\0\0\0\x01\x01\0\0\0\x01\x01\xfd\0",
+    )
+    .await
+    .unwrap();
     assert_execute_error(&mut client, ErrorKind::ER_UNSUPPORTED_PS).await;
 
     write_wire_packet(&mut client, 0, b"\x0e").await.unwrap();

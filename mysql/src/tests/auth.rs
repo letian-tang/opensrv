@@ -61,3 +61,12 @@ fn generated_scrambles_are_fresh_and_protocol_safe() {
     assert!(first.iter().all(|byte| *byte != 0 && *byte != b'$'));
     assert!(second.iter().all(|byte| *byte != 0 && *byte != b'$'));
 }
+#[test]
+fn generated_challenge_survives_ascii_client_decoding() {
+    for _ in 0..64 {
+        let challenge = crate::generate_scramble().unwrap();
+        assert!(challenge
+            .iter()
+            .all(|byte| byte.is_ascii() && !matches!(*byte, 0 | b'$')));
+    }
+}

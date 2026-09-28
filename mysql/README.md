@@ -173,8 +173,29 @@ TLS connections apply client validation to the complete encrypted handshake.
 This guarantees a UTF-8 wire encoding boundary, not MySQL collation/sorting or
 utf8mb3 character-range semantics. The backend remains responsible for SQL such
 as SET NAMES and must not claim to switch to an encoding it cannot implement.
-Full caching_sha2_password authentication, compression, cursors and query
+Full caching_sha2_password authentication, compression and query
 attributes are outside this compatibility increment.
+
+### 可选服务端游标（0.10.6 起）
+
+后端可以实现 `on_execute_cursor`、`on_fetch` 和 `on_close_cursor`，支持只读、
+向前的 prepared-statement 游标。默认实现返回不支持，已有 `on_execute` 无需修改。
+JDBC 使用 `useCursorFetch=true&useServerPrepStmts=true` 并设置正数 `setFetchSize(N)`；
+这与 `Integer.MIN_VALUE` 的普通流式读取不同。
+
+`CursorExecuteWriter::open` 发送结果元数据及 CURSOR_EXISTS；
+`CursorFetchWriter::write_row_with` 复用二进制行编码器，限制发送行数，
+`finish(false)` 保留游标，实际读到 EOF 后 `finish(true)` 发送 LAST_ROW_SENT。
+FETCH 0 不推进；恰好整批结束允许下一次空 FETCH 确认 EOF。
+`error` 丢弃未发送的部分行并关闭游标状态，传输错误必须退出连接。
+两种游标 writer 都提供 `set_status_flags`，后端可在执行、空 FETCH 或错误回滚时
+报告真实会话状态（包括显式零）；游标存在/耗尽标志仍由协议层管理，不带入后续命令。
+
+opensrv 保存元数据和协议状态，后端负责结果所有权、数量/内存限制和真正的读取。
+关闭回调必须幂等；重执行、STMT_RESET、STMT_CLOSE、耗尽及成功的连接重置都会清理。
+断连和任务取消不保证异步回调执行，后端必须用 RAII 释放资源。
+游标支持不代表完整事务、连接重置或查询取消；协议层不推断 COMMIT SQL 的含义。
+原始包回归入口：`cargo test -p opensrv-mysql --test it cursor`。
 
 ### Connector/J regression
 

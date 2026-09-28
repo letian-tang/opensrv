@@ -13,6 +13,7 @@
 // limitations under the License.
 
 mod r#async;
+mod cursor;
 mod handshake;
 mod secure;
 mod session;

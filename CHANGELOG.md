@@ -8,6 +8,20 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
 <!-- insertion marker -->
 ## Unreleased
 
+## [v0.10.6](https://github.com/letian-tang/opensrv/releases/tag/v0.10.6) - 2026-09-28
+
+- Allow cursor execute/fetch backends to report session status, including empty
+  batches, explicit zero and error rollback state, without leaking cursor flags.
+
+- Generate ASCII-safe random authentication challenges, matching MySQL and
+  preventing Connector/J's ASCII seed decoding from corrupting native auth.
+
+- Add optional read-only prepared-statement cursors, COM_STMT_FETCH and tracked
+  metadata/binary-row writers. Existing backends reject cursors by default;
+  cleanup and native result ownership remain backend responsibilities.
+
+## [v0.10.5](https://github.com/letian-tang/opensrv/releases/tag/v0.10.5)
+
 - Run independent Connector/J 8.4.0 and 9.7.0 regression suites with checked runtime
   driver versions and separate reports. Require correct negative binary TIME values
   on 9.7.0, while preserving an explicitly named legacy 8.4.0 defect characterization.

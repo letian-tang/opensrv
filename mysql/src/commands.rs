@@ -182,6 +182,10 @@ pub enum Command<'a> {
     ListFields(&'a [u8]),
     Close(u32),
     Reset(u32),
+    Fetch {
+        stmt: u32,
+        rows: u32,
+    },
     Prepare(&'a [u8]),
     Init(&'a [u8]),
     Execute {
@@ -250,6 +254,13 @@ pub fn parse(i: &[u8]) -> nom::IResult<&[u8], Command<'_>> {
             Command::Prepare,
         ),
         preceded(tag(&[CommandByte::COM_STMT_EXECUTE as u8]), execute),
+        map(
+            preceded(
+                tag(&[CommandByte::COM_STMT_FETCH as u8]),
+                nom::sequence::pair(nom::number::complete::le_u32, nom::number::complete::le_u32),
+            ),
+            |(stmt, rows)| Command::Fetch { stmt, rows },
+        ),
         preceded(
             tag(&[CommandByte::COM_STMT_SEND_LONG_DATA as u8]),
             send_long_data,

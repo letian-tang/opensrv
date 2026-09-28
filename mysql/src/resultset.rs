@@ -222,6 +222,147 @@ fn validate_metadata(columns: &[Column], metadata: &[ColumnMetadata]) -> io::Res
     Ok(())
 }
 
+/// Completes a read-only cursor execute with metadata, or an ERR response.
+#[must_use]
+pub struct CursorExecuteWriter<'a, W> {
+    pub(crate) result: QueryResultWriter<'a, W>,
+    pub(crate) columns: &'a mut Option<Vec<Column>>,
+}
+
+impl<W: AsyncWrite + Unpin> CursorExecuteWriter<'_, W> {
+    /// Report backend session state, including explicit zero, before open/error.
+    /// Cursor flags are managed by the protocol, not by the backend.
+    pub fn set_status_flags(&mut self, status: StatusFlags) {
+        self.result.set_status_flags(status);
+    }
+
+    /// Publish the cursor only after the backend has successfully executed it.
+    pub async fn open(self, columns: &[Column], metadata: &[ColumnMetadata]) -> io::Result<()> {
+        validate_metadata(columns, metadata)?;
+        if columns.is_empty() || columns.len() > u16::MAX as usize {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid cursor column count",
+            ));
+        }
+        let mut result = self.result;
+        let status = session_status_flags(result.default_status_flags)
+            | StatusFlags::SERVER_STATUS_CURSOR_EXISTS;
+        // Suppress the ordinary metadata EOF: cursor execute has exactly one
+        // terminal EOF/OK carrying CURSOR_EXISTS, including DEPRECATE_EOF clients.
+        writers::column_definitions(
+            columns.iter().zip(metadata.iter().copied()),
+            result.writer,
+            result.client_capabilities | CapabilityFlags::CLIENT_DEPRECATE_EOF,
+            status,
+        )
+        .await?;
+        result.last_end = Some(cursor_finalizer(result.client_capabilities, status));
+        result.no_more_results().await?;
+        *self.columns = Some(columns.to_vec());
+        Ok(())
+    }
+
+    /// Reject execution without opening a cursor.
+    pub async fn error(self, kind: ErrorKind, message: &[u8]) -> io::Result<()> {
+        self.result.error(kind, message).await
+    }
+}
+
+fn cursor_finalizer(capabilities: CapabilityFlags, status: StatusFlags) -> Finalizer {
+    if capabilities.contains(CapabilityFlags::CLIENT_DEPRECATE_EOF) {
+        Finalizer::Ok(OkResponse {
+            header: 0xfe,
+            status_flags: status,
+            ..Default::default()
+        })
+    } else {
+        Finalizer::Eof(status)
+    }
+}
+
+/// A FETCH response. Rows use the same binary encoder as ordinary EXECUTE.
+#[must_use]
+pub struct CursorFetchWriter<'a, W: AsyncWrite + Unpin> {
+    rows: RowWriter<'a, W>,
+    remaining: u32,
+    pub(crate) exhausted: &'a mut bool,
+}
+
+impl<'a, W: AsyncWrite + Unpin> CursorFetchWriter<'a, W> {
+    /// Report backend session state even for an empty batch or a failed FETCH.
+    /// Durable flags carry into subsequent commands; cursor flags do not.
+    pub fn set_status_flags(&mut self, status: StatusFlags) {
+        self.rows.set_status_flags(status);
+    }
+
+    pub(crate) fn new(
+        result: QueryResultWriter<'a, W>,
+        columns: &'a [Column],
+        limit: u32,
+        exhausted: &'a mut bool,
+    ) -> Self {
+        Self {
+            rows: RowWriter {
+                client_capabilities: result.client_capabilities,
+                result: Some(result),
+                columns,
+                bitmap_len: (columns.len() + 9) / 8,
+                data: Vec::new(),
+                col: 0,
+                finished: false,
+            },
+            remaining: limit,
+            exhausted,
+        }
+    }
+
+    /// Encode a complete row synchronously, then send it. The closure must only
+    /// encode columns; FETCH row-count enforcement remains in this writer.
+    pub async fn write_row_with<F>(&mut self, encode: F) -> io::Result<()>
+    where
+        F: FnOnce(&mut RowWriter<'a, W>) -> io::Result<()>,
+    {
+        if self.remaining == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "FETCH row limit exceeded",
+            ));
+        }
+        encode(&mut self.rows)?;
+        self.rows.end_row().await?;
+        self.remaining -= 1;
+        Ok(())
+    }
+
+    /// End this batch; `exhausted` means the backend actually reached EOF.
+    pub async fn finish(mut self, exhausted: bool) -> io::Result<()> {
+        if self.rows.col != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "unfinished FETCH row",
+            ));
+        }
+        let mut result = self.rows.result.take().unwrap();
+        let flag = if exhausted {
+            StatusFlags::SERVER_STATUS_LAST_ROW_SENT
+        } else {
+            StatusFlags::SERVER_STATUS_CURSOR_EXISTS
+        };
+        let status = session_status_flags(result.default_status_flags) | flag;
+        result.last_end = Some(cursor_finalizer(result.client_capabilities, status));
+        result.no_more_results().await?;
+        *self.exhausted = exhausted;
+        Ok(())
+    }
+
+    /// Discard an unsent partial row and close the cursor with an ERR.
+    pub async fn error(self, kind: ErrorKind, message: &[u8]) -> io::Result<()> {
+        *self.exhausted = true;
+        self.rows.finish_error(kind, &message).await
+    }
+}
+
 /// Convenience type for providing query results to clients.
 ///
 /// This type should not be dropped without calling
@@ -764,6 +905,167 @@ mod tests {
     use super::*;
 
     struct PartialFailure;
+
+    #[tokio::test]
+    async fn cursor_status_updates_include_empty_fetch_and_error_paths() {
+        let columns = [Column {
+            table: String::new(),
+            column: "v".into(),
+            collen: 0,
+            coltype: crate::ColumnType::MYSQL_TYPE_LONG,
+            colflags: ColumnFlags::empty(),
+        }];
+        for deprecate_eof in [false, true] {
+            let mut wire = Vec::new();
+            let mut packet = PacketWriter::new(&mut wire);
+            let mut session = StatusFlags::SERVER_STATUS_AUTOCOMMIT;
+            let mut caps = CapabilityFlags::CLIENT_PROTOCOL_41;
+            caps.set(CapabilityFlags::CLIENT_DEPRECATE_EOF, deprecate_eof);
+            let (result, completion) =
+                QueryResultWriter::new_tracked(&mut packet, true, caps, &mut session);
+            let mut saved_columns = None;
+            let mut execute = CursorExecuteWriter {
+                result,
+                columns: &mut saved_columns,
+            };
+            execute.set_status_flags(StatusFlags::SERVER_STATUS_IN_TRANS);
+            execute
+                .open(&columns, &[ColumnMetadata::default()])
+                .await
+                .unwrap();
+            assert!(completion.load(Ordering::Acquire));
+            assert_eq!(session, StatusFlags::SERVER_STATUS_IN_TRANS);
+            assert!(saved_columns.is_some());
+
+            let (result, _) = QueryResultWriter::new_tracked(&mut packet, true, caps, &mut session);
+            let mut exhausted = false;
+            let mut fetch = CursorFetchWriter::new(result, &columns, 0, &mut exhausted);
+            fetch.set_status_flags(StatusFlags::empty());
+            fetch.finish(false).await.unwrap();
+            assert!(session.is_empty());
+            assert!(!exhausted);
+
+            let (result, _) = QueryResultWriter::new_tracked(&mut packet, true, caps, &mut session);
+            let mut fetch = CursorFetchWriter::new(result, &columns, 1, &mut exhausted);
+            fetch.set_status_flags(StatusFlags::SERVER_STATUS_AUTOCOMMIT);
+            fetch.finish(true).await.unwrap();
+            assert_eq!(session, StatusFlags::SERVER_STATUS_AUTOCOMMIT);
+            assert!(exhausted);
+
+            // ERR has no status field; nevertheless save rollback state for PING
+            // and the next command, including explicit zero and no rows written.
+            let (result, _) = QueryResultWriter::new_tracked(&mut packet, true, caps, &mut session);
+            let mut fetch = CursorFetchWriter::new(result, &columns, 1, &mut exhausted);
+            fetch.set_status_flags(StatusFlags::empty());
+            fetch
+                .error(ErrorKind::ER_UNKNOWN_ERROR, b"rollback")
+                .await
+                .unwrap();
+            assert!(session.is_empty());
+            let (result, _) = QueryResultWriter::new_tracked(&mut packet, true, caps, &mut session);
+            let mut execute = CursorExecuteWriter {
+                result,
+                columns: &mut saved_columns,
+            };
+            execute.set_status_flags(StatusFlags::SERVER_STATUS_AUTOCOMMIT);
+            execute
+                .error(ErrorKind::ER_UNKNOWN_ERROR, b"execute failed")
+                .await
+                .unwrap();
+            assert_eq!(session, StatusFlags::SERVER_STATUS_AUTOCOMMIT);
+
+            packet.flush_all().await.unwrap();
+            let mut bytes = wire.as_slice();
+            let mut packets = Vec::new();
+            while !bytes.is_empty() {
+                let len = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], 0]) as usize;
+                packets.push(&bytes[4..4 + len]);
+                bytes = &bytes[4 + len..];
+            }
+            for (index, expected) in [
+                (
+                    2,
+                    StatusFlags::SERVER_STATUS_IN_TRANS | StatusFlags::SERVER_STATUS_CURSOR_EXISTS,
+                ),
+                (3, StatusFlags::SERVER_STATUS_CURSOR_EXISTS),
+                (
+                    4,
+                    StatusFlags::SERVER_STATUS_AUTOCOMMIT
+                        | StatusFlags::SERVER_STATUS_LAST_ROW_SENT,
+                ),
+            ] {
+                assert_eq!(packets[index][0], 0xfe);
+                assert_eq!(
+                    u16::from_le_bytes([packets[index][3], packets[index][4]]),
+                    expected.bits()
+                );
+            }
+            assert_eq!(packets[5][0], 0xff);
+            assert_eq!(packets[6][0], 0xff);
+        }
+    }
+
+    #[tokio::test]
+    async fn cursor_writers_track_completion_and_discard_partial_errors() {
+        let columns = [Column {
+            table: String::new(),
+            column: "v".into(),
+            collen: 0,
+            coltype: crate::ColumnType::MYSQL_TYPE_LONG,
+            colflags: ColumnFlags::empty(),
+        }];
+        for eof in [false, true] {
+            let mut wire = Vec::new();
+            let mut packet = PacketWriter::new(&mut wire);
+            let mut status = StatusFlags::SERVER_STATUS_AUTOCOMMIT;
+            let mut caps = CapabilityFlags::CLIENT_PROTOCOL_41;
+            caps.set(CapabilityFlags::CLIENT_DEPRECATE_EOF, eof);
+            let (result, completion) =
+                QueryResultWriter::new_tracked(&mut packet, true, caps, &mut status);
+            let mut exhausted = false;
+            let mut fetch = CursorFetchWriter::new(result, &columns, 1, &mut exhausted);
+            fetch
+                .write_row_with(|row| row.write_col(42i32))
+                .await
+                .unwrap();
+            assert!(fetch
+                .write_row_with(|row| row.write_col(43i32))
+                .await
+                .is_err());
+            fetch.finish(false).await.unwrap();
+            assert!(completion.load(Ordering::Acquire));
+            assert!(!exhausted);
+            assert_eq!(status, StatusFlags::SERVER_STATUS_AUTOCOMMIT);
+
+            let (result, completion) =
+                QueryResultWriter::new_tracked(&mut packet, true, caps, &mut status);
+            let mut fetch = CursorFetchWriter::new(result, &columns, 1, &mut exhausted);
+            assert!(fetch
+                .write_row_with(|row| {
+                    row.write_col(1i32)?;
+                    row.write_col(2i32)
+                })
+                .await
+                .is_err());
+            fetch
+                .error(ErrorKind::ER_UNKNOWN_ERROR, b"bad row")
+                .await
+                .unwrap();
+            assert!(completion.load(Ordering::Acquire));
+            assert!(exhausted);
+            packet.flush_all().await.unwrap();
+            let mut packets = Vec::new();
+            let mut bytes = wire.as_slice();
+            while !bytes.is_empty() {
+                let len = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], 0]) as usize;
+                packets.push(&bytes[4..4 + len]);
+                bytes = &bytes[4 + len..];
+            }
+            assert_eq!(packets.len(), 3); // one row, batch terminator, ERR (no partial row)
+            assert_eq!(packets[0], &[0, 0, 42, 0, 0, 0]);
+            assert_eq!(packets[2][0], 0xff);
+        }
+    }
 
     #[tokio::test]
     async fn empty_finalization_does_not_mark_a_missing_response_complete() {
